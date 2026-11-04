@@ -1,0 +1,20 @@
+{
+  "version": 3,
+  "net_usdt": "0",
+  "fee_usdt": "0",
+  "funding_usdt": "0",
+  "volume_usdt": "0",
+  "settled": 0,
+  "included": [],
+  "included_at": {},
+  "included_through": null,
+  "symbol_of": {},
+  "symbols": {},
+  "manual_net_usdt": "0",
+  "manual_settled": 0,
+  "manual_ids": [],
+  "unwound": 0,
+  "unwound_usdt": "0",
+  "unwound_sealed": true,
+  "updated_at": "2026-10-31T15:53:01.093992Z"
+}
