@@ -1309,6 +1309,11 @@ impl Broker for HyperliquidBroker {
             let state = self
                 .state_from_remote(remote, Some(client_order_id))
                 .await?;
+            if let Some(decided) =
+                explicit_reject_if_observation_has_no_fill(saved.as_ref(), &state)
+            {
+                return decided.map(Some);
+            }
             self.remember_terminal_state(&cloid, &state)?;
             return Ok(Some(state));
         }
@@ -1319,6 +1324,11 @@ impl Broker for HyperliquidBroker {
             if let Some(oid) = oid.or(saved.oid)
                 && let Some(state) = self.state_from_oid_fills(&saved, oid).await?
             {
+                if let Some(decided) =
+                    explicit_reject_if_observation_has_no_fill(Some(&saved), &state)
+                {
+                    return decided.map(Some);
+                }
                 self.remember_terminal_state(&cloid, &state)?;
                 return Ok(Some(state));
             }
@@ -2542,6 +2552,26 @@ fn state_from_explicit_reject(saved: &Reservation) -> Option<OrderState> {
     Some(state)
 }
 
+/// 预留单已经是「没有 oid 的明确拒绝」，后来又观察到一笔终态。
+///
+/// 零成交和拒绝一致：把拒绝状态交还给调用方写入台账，不再把终态写进意图日志。
+/// 写进去会让下次启动读日志失败。有成交仍是矛盾，不能当成没成交。不是这类拒绝时返回 `None`。
+fn explicit_reject_if_observation_has_no_fill(
+    saved: Option<&Reservation>,
+    observed: &OrderState,
+) -> Option<ArbResult<OrderState>> {
+    let rejected = state_from_explicit_reject(saved?)?;
+    if observed.filled_usdt > Decimal::ZERO || observed.status == OrderStatus::Filled {
+        return Some(Err(error(
+            "reserved order is both rejected and terminally observed",
+        )));
+    }
+    if observed.status.is_live() {
+        return Some(Err(error("refusing to journal a live order as terminal")));
+    }
+    Some(Ok(rejected))
+}
+
 fn match_historical_order<'a>(
     rows: &'a [RemoteStatus],
     oid: Option<u64>,
@@ -3007,6 +3037,40 @@ mod tests {
         assert!(restored.oid.is_none());
         drop(reopened);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_zero_fill_observation_after_an_explicit_reject_closes_as_rejected() {
+        let order = order();
+        let saved = Reservation {
+            account: "account".into(),
+            signer: "signer".into(),
+            cloid: "abc".into(),
+            order: order.clone(),
+            effective_quantity: dec!(1.234),
+            oid: None,
+            reject: Some("Order could not immediately match".into()),
+            terminal: None,
+        };
+        let mut observed = OrderState::new(order.clone());
+        observed.status = OrderStatus::Cancelled;
+        observed.filled_usdt = dec!(0);
+        observed.venue_order_id = Some("99".into());
+        let decided = explicit_reject_if_observation_has_no_fill(Some(&saved), &observed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decided.status, OrderStatus::Rejected);
+        assert_eq!(decided.filled_usdt, dec!(0));
+        assert!(decided.venue_order_id.is_none());
+
+        let mut filled = observed.clone();
+        filled.status = OrderStatus::Filled;
+        filled.filled_usdt = dec!(1);
+        filled.average_price = Some(dec!(100));
+        assert!(explicit_reject_if_observation_has_no_fill(Some(&saved), &filled)
+            .unwrap()
+            .is_err());
+        assert!(explicit_reject_if_observation_has_no_fill(None, &observed).is_none());
     }
 
     fn filled(order: &NewOrder, oid: u64) -> OrderState {
