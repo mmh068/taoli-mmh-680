@@ -11,6 +11,7 @@ async fn live_probe() {
         size_usdt: Decimal::from(2000),
         alert_net_pct: Decimal::new(5, 2),
         equities_only: false,
+        exclude_preipo: false,
         dir: dir.clone(),
         pairs: Pair::parse_list(pairs::DEFAULT_PAIRS).unwrap(),
         entropy_rebate: Decimal::TWO,
@@ -96,6 +97,7 @@ fn config() -> Config {
         size_usdt: dec!(1000),
         alert_net_pct: dec!(0.05),
         equities_only: false,
+        exclude_preipo: false,
         dir: std::env::temp_dir(),
         pairs: vec![Pair::RH],
         entropy_rebate: Decimal::ZERO,
@@ -736,6 +738,33 @@ fn catalogs_keep_fees_honest_and_pairs_need_a_verified_identity() {
         assert!(all.contains(&Pair { a, b }), "{a}:{b}");
     }
     assert!(pairs::all_pairs(&[Venue::Arcus, Venue::Binance]).is_empty());
+}
+
+#[test]
+fn preipo_lists_exclude_each_venues_full_section_without_dropping_unrelated_markets() {
+    let lighter = format!(
+        "{}tokens:[{{symbol:`OPENAI`,name:`OpenAI`,logo:`x`,logo_extension:`png`,description_key:`x`,gecko_id:`x`,paprika_id:`x`,market:`PERPS`,asset_type:`RWA`,categories:[`PRE_IPO`]}},{{symbol:`AAPL`,name:`Apple`,logo:`x`,logo_extension:`png`,description_key:`x`,gecko_id:`x`,paprika_id:`x`,market:`PERPS`,asset_type:`RWA`,categories:[`STOCK`]}},{{symbol:`BTC`,name:`Bitcoin`,logo:`x`,logo_extension:`png`,description_key:`x`,gecko_id:`x`,paprika_id:`x`,market:`PERPS`,asset_type:`CRYPTO`,categories:[`PRE_IPO`]}},{{symbol:`SPACEX`,name:`SpaceX`,logo:`x`,logo_extension:`png`,description_key:`x`,gecko_id:`x`,paprika_id:`x`,market:`SPOT`,asset_type:`RWA`,categories:[`STOCK`,`PRE_IPO`]}}],Kn=",
+        catalog::LIGHTER_TOKEN_TABLE_MARKER
+    );
+    assert_eq!(
+        catalog::lighter_rh_preipo_bases(&lighter).unwrap().into_iter().collect::<Vec<_>>(),
+        ["OPENAI", "SPACEX"]
+    );
+    assert!(catalog::lighter_rh_preipo_bases("tokens:[{symbol:`OPENAI`,asset_type:`RWA`,categories:[`PRE_IPO`]}],").is_err());
+
+    let categories = serde_json::json!([
+        ["io:OAI", "preipo"],
+        ["io:AAPL", "stocks"],
+        ["xyz:OURA", "preipo"],
+        ["xyz:GOLD", "commodities"],
+        ["TSLA", "preipo"],
+        ["BTC", "crypto"],
+        ["vntl:SPACEX", "preipo"]
+    ]);
+    assert_eq!(
+        catalog::hyperliquid_preipo_bases(&categories).unwrap().into_iter().collect::<Vec<_>>(),
+        ["OPENAI", "OURA", "TSLA"]
+    );
 }
 
 #[test]

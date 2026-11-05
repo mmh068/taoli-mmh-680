@@ -3016,8 +3016,13 @@ function renderRhSpread() {
   const all = view.lines || [];
   const lines = filter === 'all' ? all : all.filter((l) => l.pair === filter);
   const signals = lines.filter((l) => l.best?.signal);
+  const preipo = view.preipo_bases || [];
+  const preipoText = preipo.length
+    ? `${preipo.length}：${preipo.join('、')}`
+    : '还没读到';
   $('rh-stats').innerHTML = [
     ['合约', String(lines.length), ''],
+    ['Pre-IPO', preipoText, view.exclude_preipo ? 'neg' : 'dim'],
     ['当前信号', String(signals.length), signals.length ? 'pos' : 'dim'],
     ['估算名义', `$${num(view.size_usdt).toLocaleString('en-US')}`, ''],
     ['提醒门槛', `≥ ${num(view.alert_net_pct)}%`, ''],
@@ -3027,7 +3032,7 @@ function renderRhSpread() {
   const pairRows = shownPairs.map((p) => `<li><b>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}</b>：${p.markets} 个合约，往返手续费 ${esc(feeText(p))}，已攒历史 ${(p.history_minutes / 60).toFixed(1)} 小时${rhAutoTradable(p) ? '，<span class="pos">可自动交易</span>' : '，只监控（实盘没连这两家）'}${p.note ? ` <span class="muted">（${esc(p.note)}）</span>` : ''}</li>`).join('');
   const notices = [];
   if (view.error) notices.push(`<div class="notice error">${esc(view.error)}</div>`);
-  if (pairRows) notices.push(`<div class="notice"><ul>${pairRows}</ul><span class="small muted">基差 = (左 − 右) / 均值。每个合约每个时段至少 ${view.min_minutes} 分钟样本才算出「正常基差」并开始提醒（窗口 ${view.window_days} 天）；在那之前只显示「收敛到 0」的估算，对股票类合约通常偏乐观。往返费按基础档上限算（HL 子交易所含 growth mode 折扣与 Entropy 返佣设置）。</span></div>`);
+  if (pairRows) notices.push(`<div class="notice"><ul>${pairRows}</ul><span class="small muted">Pre-IPO 名单来自 Lighter RH 与 Hyperliquid，重复币只记一次；${view.exclude_preipo ? '当前已从价差监控排除。' : '当前开关关闭，仍正常监控。'} 基差 = (左 − 右) / 均值。每个合约每个时段至少 ${view.min_minutes} 分钟样本才算出「正常基差」并开始提醒（窗口 ${view.window_days} 天）；在那之前只显示「收敛到 0」的估算，对股票类合约通常偏乐观。往返费按基础档上限算（HL 子交易所含 growth mode 折扣与 Entropy 返佣设置）。</span></div>`);
   $('rh-notice').innerHTML = notices.join('');
   const shown = $('rh-signal-only').checked ? signals : lines;
   $('rh-rows').innerHTML = shown.map((line) => rhRow(line, view)).join('');
@@ -3183,14 +3188,14 @@ function rhAutoHtml(a, cfg) {
       <span class="small muted">${esc(data.status || '')}</span>
     </div>
     ${data.disabled_reason && !on ? `<div class="notice error">上次自动关闭的原因：${esc(data.disabled_reason)}</div>` : ''}
-    <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净利润」达到门槛、且开仓可成交价差与收敛到 0 净收益都为正、连续保持够久后，按下面的参数自动下一笔价差单。资金费不计入这笔净利润。资金费核算默认关闭；选择 1、4 或 8 小时后，还要求回到正常净利润加上这段时间的资金费高于配置门槛（默认高于 0%）才合格。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；填在「不做这些合约」里的不会开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
+    <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净利润」达到门槛、且开仓可成交价差与收敛到 0 净收益都为正、连续保持够久后，按下面的参数自动下一笔价差单。资金费不计入这笔净利润。资金费核算默认关闭；选择 1、4 或 8 小时后，还要求回到正常净利润加上这段时间的资金费高于配置门槛（默认高于 0%）才合格。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；填在「不做这些合约」里的不生成监控行；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
     <div class="rh-auto-grid">
       <label class="field"><span>账户</span><select data-rh-auto="mode">
         <option value="paper"${f.mode === 'paper' ? ' selected' : ''}>纸面（不碰真实资金）</option>
         <option value="live"${f.mode === 'live' ? ' selected' : ''}>实盘（真实资金）</option>
       </select></label>
       ${RH_AUTO_FIELDS.map(field).join('')}
-      <label class="field" title="逗号分隔，如 NVDA,SPY；留空 = 不排除任何合约"><span>不做这些合约</span><input type="text" data-rh-auto="symbols" value="${esc(f.symbols)}" placeholder="不排除" /></label>
+      <label class="field" title="逗号分隔，如 NVDA,SPY；留空 = 监控全部合约"><span>不做这些合约</span><input type="text" data-rh-auto="symbols" value="${esc(f.symbols)}" placeholder="不排除" /></label>
       <label class="field" title="默认关闭。开启后按这里选的 1、4 或 8 小时核算。回到正常净利润不含资金费，先过上面的门槛，再加上这段资金费，不高于配置值不合格"><span>资金费核算</span><select data-rh-auto="funding_check_hours">
         <option value=""${f.funding_check_hours === '' ? ' selected' : ''}>关闭</option>
         <option value="1"${f.funding_check_hours === '1' ? ' selected' : ''}>开仓后 1 小时</option>

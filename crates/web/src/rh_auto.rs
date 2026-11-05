@@ -7,7 +7,7 @@
 //!
 //! - 默认关闭；开启实盘要在请求里显式确认（`confirm = "LIVE"`）；
 //! - 同一合约已有敞口就不再开（不论是不是自动开的）；
-//! - 面板「不做这些合约」里的合约不开；留空不排除；
+//! - 面板「不做这些合约」里的合约不生成价差监控行；留空不排除；
 //! - 自动开的仓位同时最多 `max_positions` 笔，每个 UTC 日最多 `daily_max_opens` 笔；
 //! - 每次尝试后该合约冷却；两次开仓之间至少隔 [`MIN_OPEN_GAP`]；
 //! - 必须至少带一条退出规则（回到正常基差平仓 / 止盈）：没有退出条件的自动仓位只会一直挂着；
@@ -101,7 +101,7 @@ pub struct Settings {
     pub max_positions: usize,
     /// 每个 UTC 日最多自动开几笔。
     pub daily_max_opens: usize,
-    /// 不做这些合约（base，大写）；空 = 不排除。
+    /// 不做这些合约（base，大写）；空 = 不排除。这些合约不生成价差监控行。
     #[serde(default)]
     pub symbols: Vec<String>,
     /// 开仓后资金费核算小时。`None` 关闭；只允许 1、4 或 8。
@@ -1414,6 +1414,7 @@ pub async fn api_set(
         .and_then(Decimal::from_f64_retain);
     match state.rh_auto.update(settings, max, confirm).await {
         Ok(saved) => {
+            state.rh_spread.set_excluded_bases(saved.symbols.iter());
             crate::opportunity_log::remember_auto_settings(&saved);
             warn!("价差自动交易设置已更新：{}", describe(&saved));
             state
@@ -1493,6 +1494,8 @@ mod tests {
             alert_net_pct: dec("0.05"),
             min_minutes: 120,
             window_days: 7,
+            exclude_preipo: false,
+            preipo_bases: Vec::new(),
             pairs: Vec::new(),
             connected: Connected {
                 venues: [(Venue::Arcus, true), (Venue::LighterRh, true)].into(),

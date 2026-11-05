@@ -57,6 +57,8 @@ pub struct Config {
     pub alert_net_pct: Decimal,
     /// 只看股票类（股票、指数、商品），不看加密币。
     pub equities_only: bool,
+    /// 排除 Lighter RH 与 Hyperliquid 分类名单里的 Pre-IPO 合约。
+    pub exclude_preipo: bool,
     pub dir: PathBuf,
     /// 监控哪几组（`ARB_RH_SPREAD_PAIRS`）。
     pub pairs: Vec<Pair>,
@@ -106,6 +108,10 @@ impl Config {
             )?,
             equities_only: matches!(
                 var("ARB_RH_SPREAD_EQUITIES_ONLY").as_deref(),
+                Some("1" | "on" | "true")
+            ),
+            exclude_preipo: matches!(
+                var("ARB_RH_SPREAD_EXCLUDE_PREIPO").as_deref(),
                 Some("1" | "on" | "true")
             ),
             dir: var("ARB_RH_SPREAD_DIR").map_or_else(|| PathBuf::from("rh-spread"), PathBuf::from),
@@ -197,6 +203,10 @@ pub struct View {
     pub alert_net_pct: Decimal,
     pub min_minutes: usize,
     pub window_days: i64,
+    /// 是否已开启 Pre-IPO 排除。
+    pub exclude_preipo: bool,
+    /// 当前读到的 Pre-IPO 币名（两家去重）。名单始终显示，是否排除由开关决定。
+    pub preipo_bases: Vec<String>,
     /// 各组的概况（顺序 = 配置顺序）。
     pub pairs: Vec<PairView>,
     /// 各家行情连接。
@@ -417,6 +427,12 @@ enum Feed {
     Up(Venue, bool),
 }
 
+/// 重建监控行所需的最近一次市场目录。各组历史仍由监控线程独占。
+struct Runtime {
+    catalog: Catalog,
+    identity: Option<pairs::Identity>,
+}
+
 /// 一组的运行状态。
 struct PairState {
     pair: Pair,
@@ -440,6 +456,15 @@ pub struct Monitor {
     sent: std::sync::Mutex<std::collections::VecDeque<Instant>>,
     /// 实盘还敞口的合约 base。提醒跳过这些币。
     held_bases: HeldBases,
+    /// 「不做这些合约」。这些币不生成监控行，也不订阅盘口。
+    excluded_bases: std::sync::RwLock<HashSet<String>>,
+    runtime: std::sync::Mutex<Option<Runtime>>,
+    /// 最近一次成功取到的 Pre-IPO 币名。两个来源合并去重；整次刷新失败时沿用。
+    preipo_bases: std::sync::RwLock<HashSet<String>>,
+    /// 排除名单变化后立即唤醒监控线程重建。
+    rebuild_now: tokio::sync::Notify,
+    /// 通知发出时循环可能尚未等待：这个标记保证下一次循环仍会重建。
+    rebuild_requested: std::sync::atomic::AtomicBool,
 }
 
 /// 订阅变化：每家场所要订阅的市场名（全量）。
@@ -488,6 +513,8 @@ impl Monitor {
             alert_net_pct: config.alert_net_pct,
             min_minutes: history::MIN_MINUTES,
             window_days: history::WINDOW_DAYS,
+            exclude_preipo: config.exclude_preipo,
+            preipo_bases: Vec::new(),
             pairs: config
                 .pairs
                 .iter()
@@ -513,8 +540,51 @@ impl Monitor {
             alerts,
             sent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             held_bases,
+            excluded_bases: std::sync::RwLock::new(HashSet::new()),
+            runtime: std::sync::Mutex::new(None),
+            preipo_bases: std::sync::RwLock::new(HashSet::new()),
+            rebuild_now: tokio::sync::Notify::new(),
+            rebuild_requested: std::sync::atomic::AtomicBool::new(false),
         })
     }
+
+    /// 替换「不做这些合约」名单，并立刻重建监控行。空名单不排除。
+    pub fn set_excluded_bases(&self, bases: impl IntoIterator<Item = impl AsRef<str>>) {
+        let next = bases
+            .into_iter()
+            .map(|base| base.as_ref().trim().to_ascii_uppercase())
+            .filter(|base| !base.is_empty())
+            .collect();
+        *self
+            .excluded_bases
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+        self.rebuild_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.rebuild_now.notify_one();
+    }
+
+    fn store_runtime(&self, catalog: Catalog, identity: Option<pairs::Identity>) {
+        *self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Runtime { catalog, identity });
+    }
+
+    fn update_runtime(&self, catalog: &Catalog, identity: Option<pairs::Identity>) {
+        if let Some(runtime) = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            runtime.catalog.clone_from(catalog);
+            runtime.identity = identity;
+        }
+    }
+
+
 
     pub async fn view(&self) -> View {
         self.view.read().await.clone()
@@ -609,16 +679,96 @@ impl Monitor {
     }
 
     /// 按市场列表与身份簇重算各组的合约；返回每家要订阅的市场名。
+    async fn excluded_bases(&self, client: &reqwest::Client) -> HashSet<String> {
+        let manual = self
+            .excluded_bases
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let lighter = self.lighter_rh_preipo_bases(client).await;
+        let hyperliquid = self.hyperliquid_preipo_bases(client).await;
+        let mut cached = self
+            .preipo_bases
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match (lighter, hyperliquid) {
+            (Ok(lighter), Ok(hyperliquid)) => {
+                *cached = lighter.into_iter().chain(hyperliquid).collect();
+            }
+            (Ok(bases), Err(error)) | (Err(error), Ok(bases)) => {
+                warn!("有一份 Pre-IPO 名单取失败，沿用上一次完整名单：{error:#}");
+                let _ = bases;
+            }
+            (Err(lighter), Err(hyperliquid)) => {
+                warn!("Pre-IPO 名单取失败，沿用上一次：{lighter:#}；{hyperliquid:#}");
+            }
+        }
+        manual.into_iter().chain(cached.iter().cloned()).collect()
+    }
+
+    fn preipo_bases(&self) -> HashSet<String> {
+        self.preipo_bases
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn cached_excluded_bases(&self) -> HashSet<String> {
+        let mut excluded = self
+            .excluded_bases
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if self.config.exclude_preipo {
+            excluded.extend(self.preipo_bases());
+        }
+        excluded
+    }
+
+    async fn lighter_rh_preipo_bases(
+        &self,
+        client: &reqwest::Client,
+    ) -> anyhow::Result<HashSet<String>> {
+        let script = client
+            .get(catalog::LIGHTER_TOKEN_CATEGORIES_URL)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Ok(catalog::lighter_rh_preipo_bases(&script)?
+            .into_iter()
+            .collect())
+    }
+
+    async fn hyperliquid_preipo_bases(
+        &self,
+        client: &reqwest::Client,
+    ) -> anyhow::Result<HashSet<String>> {
+        let rows: Value = arb_venues::get_json(
+            client
+                .post("https://api.hyperliquid.xyz/info")
+                .json(&serde_json::json!({"type": "perpCategories"})),
+            Venue::Hyperliquid,
+        )
+        .await?;
+        Ok(catalog::hyperliquid_preipo_bases(&rows)?.into_iter().collect())
+    }
+
     fn rebuild(
         &self,
         states: &mut [PairState],
         catalog: &Catalog,
         identity: Option<&pairs::Identity>,
+        excluded: &HashSet<String>,
     ) -> Subscriptions {
         let mut subs: HashMap<Venue, std::collections::BTreeSet<String>> = HashMap::new();
         for state in states.iter_mut() {
             let pair = state.pair;
-            let fresh = pairs::pair_markets(pair, catalog, identity, self.config.equities_only);
+            let fresh = pairs::pair_markets(pair, catalog, identity, self.config.equities_only)
+                .into_iter()
+                .filter(|market| !excluded.contains(&market.base))
+                .collect::<Vec<_>>();
             if pair.needs_identity_check() {
                 let still: HashSet<String> = fresh.iter().map(|market| market.base.clone()).collect();
                 state.watched.retain(|base, _| !still.contains(base));
@@ -745,7 +895,9 @@ impl Monitor {
             .get()
             .await
             .map(|snap| pairs::identity_of(&snap.report));
-        let mut subs = self.rebuild(&mut states, &catalog, identity.as_ref());
+        let excluded = self.excluded_bases(&client).await;
+        let mut subs = self.rebuild(&mut states, &catalog, identity.as_ref(), &excluded);
+        self.store_runtime(catalog.clone(), identity.clone());
         let mut identity_ready = identity.is_some();
         info!(
             pairs = %self.config.pairs.iter().map(|p| p.id()).collect::<Vec<_>>().join(","),
@@ -780,6 +932,7 @@ impl Monitor {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut refresh = tokio::time::interval(Duration::from_secs(300));
         refresh.tick().await;
+        let mut next_preipo_refresh = Instant::now() + Duration::from_secs(6 * 60 * 60);
         // 信号从什么时候开始连续成立（组, 合约, 方向）。
         let mut signal_since: HashMap<(String, String, &'static str), Instant> = HashMap::new();
 
@@ -799,12 +952,44 @@ impl Monitor {
                         apply(&mut books, venue, event, resub);
                     }
                 },
+                _ = self.rebuild_now.notified(), if self.rebuild_requested.load(std::sync::atomic::Ordering::Acquire) => {
+                    self.rebuild_requested.store(false, std::sync::atomic::Ordering::Release);
+                    let (fresh_catalog, fresh_identity) = self
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                        .map(|runtime| (runtime.catalog.clone(), runtime.identity.clone()))
+                        .unwrap_or_default();
+                    if !fresh_catalog.is_empty() {
+                        catalog = fresh_catalog;
+                        let excluded = self.cached_excluded_bases();
+                        let fresh = self.rebuild(&mut states, &catalog, fresh_identity.as_ref(), &excluded);
+                        if fresh != subs {
+                            subs = fresh;
+                            for (venue, sender) in &senders {
+                                let list = subs.get(venue).cloned().unwrap_or_default();
+                                if *sender.borrow() != list {
+                                    let _ = sender.send(list);
+                                }
+                            }
+                        }
+                    }
+                }
                 _ = refresh.tick() => {
                     // 交易时段（isOutsideRth）、费率、上下架会变：5 分钟刷新一次。
+                    // Pre-IPO 分类变化很慢：到期后搭这趟请求，不再单独开一轮。
                     let _ = self.refresh_catalog(&client, &mut catalog).await;
                     let identity = cache.get().await.map(|snap| pairs::identity_of(&snap.report));
                     identity_ready |= identity.is_some();
-                    let fresh = self.rebuild(&mut states, &catalog, identity.as_ref());
+                    let excluded = if Instant::now() >= next_preipo_refresh {
+                        next_preipo_refresh = Instant::now() + Duration::from_secs(6 * 60 * 60);
+                        self.excluded_bases(&client).await
+                    } else {
+                        self.cached_excluded_bases()
+                    };
+                    let fresh = self.rebuild(&mut states, &catalog, identity.as_ref(), &excluded);
+                    self.update_runtime(&catalog, identity);
                     if fresh != subs {
                         subs = fresh;
                         for (venue, sender) in &senders {
@@ -829,7 +1014,9 @@ impl Monitor {
                     {
                         identity_ready = true;
                         let identity = pairs::identity_of(&snap.report);
-                        subs = self.rebuild(&mut states, &catalog, Some(&identity));
+                        let excluded = self.cached_excluded_bases();
+                        subs = self.rebuild(&mut states, &catalog, Some(&identity), &excluded);
+                        self.update_runtime(&catalog, Some(identity));
                         for (venue, sender) in &senders {
                             let _ = sender.send(subs.get(venue).cloned().unwrap_or_default());
                         }
@@ -934,6 +1121,12 @@ impl Monitor {
                         .collect();
                     let mut view = self.view.write().await;
                     view.connected = connected.clone();
+                    view.exclude_preipo = self.config.exclude_preipo;
+                    view.preipo_bases = {
+                        let mut bases: Vec<String> = self.preipo_bases().into_iter().collect();
+                        bases.sort();
+                        bases
+                    };
                     view.pairs = pair_views;
                     view.updated_at = Some(now_utc);
                     view.lines = lines;

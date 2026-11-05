@@ -815,6 +815,7 @@ Arcus（`/v1/funding`）；其它场所显示「未接入」，不拿 0 冒充�
 | `ARB_RH_SPREAD_SIZE` | `2000` | 估算用的单笔名义（USDT，100 ~ 100000） |
 | `ARB_RH_SPREAD_ALERT_PCT` | `0.05` | 提醒门槛：回到正常水平的预估净收益（%，0.001 ~ 5） |
 | `ARB_RH_SPREAD_EQUITIES_ONLY` | 关 | `on` 只看股票、指数、商品，不看加密币 |
+| `ARB_RH_SPREAD_EXCLUDE_PREIPO` | 关 | `on` 排除 Lighter RH 与 Hyperliquid 分类名单里的 Pre-IPO 合约 |
 | `ARB_RH_SPREAD_DIR` | `rh-spread` | 分钟历史目录（相对工作目录）；自动交易设置也存在这里（`auto.json`） |
 | `ARB_RH_SPREAD_PAIRS` | 见下 | 监控哪几组，`场所A:场所B` 逗号分隔；支持 `arcus`、`lighter-rh`、`hyperliquid`、`hyperliquid-xyz`、`hyperliquid-io` |
 | `ARB_ENTROPY_SELF_REBATE` | `0` | Entropy（`hyperliquid-io` 的部署方）自返佣比例，小数：Tier 4 = `2`（200%） |
