@@ -751,6 +751,16 @@ fn preipo_lists_exclude_each_venues_full_section_without_dropping_unrelated_mark
         ["OPENAI", "SPACEX"]
     );
     assert!(catalog::lighter_rh_preipo_bases("tokens:[{symbol:`OPENAI`,asset_type:`RWA`,categories:[`PRE_IPO`]}],").is_err());
+    let renamed = lighter.replacen("],Kn=", "]},Jn=", 1);
+    assert_eq!(
+        catalog::lighter_rh_preipo_bases(&renamed).unwrap().into_iter().collect::<Vec<_>>(),
+        ["OPENAI", "SPACEX"]
+    );
+    let truncated = format!(
+        "{}tokens:[{{symbol:`OPENAI`,asset_type:`RWA`,categories:[`PRE_IPO`]}},",
+        catalog::LIGHTER_TOKEN_TABLE_MARKER
+    );
+    assert!(catalog::lighter_rh_preipo_bases(&truncated).is_err());
 
     let categories = serde_json::json!([
         ["io:OAI", "preipo"],

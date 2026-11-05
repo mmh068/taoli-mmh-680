@@ -101,13 +101,12 @@ pub fn lighter(details: &Value) -> anyhow::Result<BTreeMap<String, VenueMarket>>
 /// Lighter 前端分类表里，`asset_type = RWA` 且 `categories` 含 `PRE_IPO` 的全部币名。
 ///
 /// 只认这两个显式字段。模块版本不符或表被截断时报错，不把残缺名单当成完整名单。
+///
+/// 表后面的压缩变量名会变（曾经是 `],Kn=`，现在是 `]},Jn=`）。只要求 `tokens:[` 配平闭合，且闭合后文件还没有结束。
 pub fn lighter_rh_preipo_bases(script: &str) -> anyhow::Result<BTreeSet<String>> {
-    let table_at = script
-        .find("tokens:[")
-        .ok_or_else(|| anyhow::anyhow!("Lighter 分类表没有 tokens"))?;
-    let table = &script[table_at..];
+    let table = tokens_table(script)?;
     anyhow::ensure!(
-        script.contains(LIGHTER_TOKEN_TABLE_MARKER) && table.contains("],Kn="),
+        script.contains(LIGHTER_TOKEN_TABLE_MARKER),
         "Lighter 分类表版本已变或内容不完整"
     );
     let mut out = BTreeSet::new();
@@ -131,6 +130,43 @@ pub fn lighter_rh_preipo_bases(script: &str) -> anyhow::Result<BTreeSet<String>>
     }
     anyhow::ensure!(!out.is_empty(), "Lighter RH 的 RWA/Pre-IPO 名单为空");
     Ok(out)
+}
+
+/// `tokens:[...]` 的闭合范围。反引号里的括号不算。没闭合，或闭合后就是文件末尾，视为截断。
+fn tokens_table(script: &str) -> anyhow::Result<&str> {
+    let table_at = script
+        .find("tokens:[")
+        .ok_or_else(|| anyhow::anyhow!("Lighter 分类表没有 tokens"))?;
+    let table = &script[table_at..];
+    let start = table
+        .find('[')
+        .ok_or_else(|| anyhow::anyhow!("Lighter 分类表没有 tokens"))?;
+    let mut depth = 0i32;
+    let mut in_tick = false;
+    for (index, byte) in table.bytes().enumerate().skip(start) {
+        if byte == b'`' {
+            in_tick = !in_tick;
+            continue;
+        }
+        if in_tick {
+            continue;
+        }
+        match byte {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    anyhow::ensure!(
+                        index + 1 < table.len(),
+                        "Lighter 分类表版本已变或内容不完整"
+                    );
+                    return Ok(&table[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(anyhow::anyhow!("Lighter 分类表版本已变或内容不完整"))
 }
 
 fn field<'a>(row: &'a str, name: &str) -> anyhow::Result<&'a str> {
