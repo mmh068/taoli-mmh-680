@@ -817,12 +817,12 @@ Arcus（`/v1/funding`）；其它场所显示「未接入」，不拿 0 冒充�
 | `ARB_RH_SPREAD_EQUITIES_ONLY` | 关 | `on` 只看股票、指数、商品，不看加密币 |
 | `ARB_RH_SPREAD_EXCLUDE_PREIPO` | 关 | `on` 排除 Lighter RH 与 Hyperliquid 分类名单里的 Pre-IPO 合约 |
 | `ARB_RH_SPREAD_DIR` | `rh-spread` | 分钟历史目录（相对工作目录）；自动交易设置也存在这里（`auto.json`） |
-| `ARB_RH_SPREAD_PAIRS` | 见下 | 监控哪几组，`场所A:场所B` 逗号分隔；支持 `arcus`、`lighter-rh`、`hyperliquid`、`hyperliquid-xyz`、`hyperliquid-io` |
+| `ARB_RH_SPREAD_EXCLUDE` | 空 | 不监控哪些交易所，逗号分隔；支持 `arcus`、`lighter-rh`、`hyperliquid`、`hyperliquid-xyz`、`hyperliquid-io`。只停价差监控和自动开仓，不平已有仓 |
 | `ARB_ENTROPY_SELF_REBATE` | `0` | Entropy（`hyperliquid-io` 的部署方）自返佣比例，小数：Tier 4 = `2`（200%） |
 
 ### 多组监控
 
-默认（不设 `ARB_RH_SPREAD_PAIRS`）：**按凭据识别出的实盘场所**（与实盘同一套识别，`ARB_LIVE_VENUES` 或自动识别）里价差监控支持的，两两组合。
+默认（不设 `ARB_RH_SPREAD_EXCLUDE`）：**按凭据识别出的实盘场所**（与实盘同一套识别，`ARB_LIVE_VENUES` 或自动识别）里价差监控支持的，两两组合。
 5 家都配了 API 时是 10 组；识别不出两家时退回 `arcus:lighter-rh`、`hyperliquid-xyz:lighter-rh`、`arcus:hyperliquid-xyz`、`hyperliquid-io:lighter-rh`、`arcus:hyperliquid-io`。
 组内左右顺序固定（Arcus、Hyperliquid、HL-xyz、HL-io、Lighter RH），已攒的历史方向不变。
 每家只连一条行情 WebSocket，几组共用（Hyperliquid 用 `l2Book` 订阅，每侧 20 档完整快照，实测约 5 秒一次，15 秒没更新就不算数）。

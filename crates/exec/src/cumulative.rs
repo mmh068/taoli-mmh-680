@@ -664,6 +664,7 @@ mod tests {
             open_report: None,
             planned_long: None,
             planned_short: None,
+            settled_legs: Vec::new(),
             origin: None,
         }
     }

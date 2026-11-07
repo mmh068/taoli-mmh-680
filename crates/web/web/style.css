@@ -459,3 +459,15 @@ footer p { margin: 0 0 6px; max-width: 980px; }
   z-index: 1;
 }
 #ledger-symbols-wrap tbody tr { cursor: default; }
+#pos-closed tr.closed-detail { cursor: default; }
+#pos-closed tr.closed-detail:hover { background: transparent; }
+#pos-closed tr.closed-detail td {
+  white-space: normal;
+  background: var(--surface);
+  padding-top: 0;
+  padding-bottom: 12px;
+}
+.closed-detail-box { padding: 2px 2px 0; }
+.closed-kicker { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
+.closed-note { margin: 8px 0; color: var(--text-2); font-size: 12.5px; line-height: 1.45; white-space: normal; }
+.closed-detail-box h4 { margin: 8px 0; font-size: 12px; font-weight: 600; }

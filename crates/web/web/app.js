@@ -117,6 +117,7 @@ let state = {
     ruleDrafts: new Map(),
     modeSeq: 0,
     loadSeq: 0,
+    closedId: null,
   },
 };
 
@@ -2796,6 +2797,63 @@ function renderPositions() {
   renderClosedPositions();
 }
 
+function externalReason(note) {
+  const text = note || '';
+  const fresh = text.match(/^人工外部处理：([^；。]+)/);
+  if (fresh && !/核对|对账|稍后/.test(fresh[1])) return fresh[1];
+  if (text.includes('第一腿') && text.includes('结果不明')) return '第一腿成交不明，开仓中断，已在交易所手平';
+  if (text.includes('第二腿') && text.includes('结果不明')) return '第二腿成交不明，已在交易所手平';
+  if (text.includes('回滚未完全成功') || text.includes('回滚没完成')) return '回滚没完成，已在交易所手平';
+  if (text.includes('剩下的腿')) return '平仓中断，剩下的腿已在交易所手平';
+  if (text.includes('平仓没走完') || text.includes('平仓未完成')) return '平仓没走完，已在交易所手平';
+  if (text.includes('两腿成交没记上')) return '两腿成交没记上，已在交易所手平';
+  if (text.includes('第一腿成交没记上')) return '第一腿成交没记上，开仓中断，已在交易所手平';
+  if (text.includes('只剩一条腿')) return '只剩一条腿，已在交易所手平';
+  if (text.includes('只成一条腿') || text.includes('只记下一条腿')) return '只成一条腿，已在交易所手平';
+  if (text.includes('没记下腿')) return '开仓中断，成交没记上，已在交易所手平';
+  if (text.includes('在交易所外部平仓') || text.includes('持仓已在交易所手平')) return '持仓已在交易所手平';
+  return '人工外部处理';
+}
+
+function qtyText(value) {
+  const parsed = num(value);
+  if (parsed === null) return '—';
+  return parsed.toFixed(8).replace(/\.?0+$/, '');
+}
+
+function closedStatusText(p) {
+  return p.closed_externally ? externalReason(p.note) : (STATUS_LABEL[p.status] || p.status);
+}
+
+function closedLegCard(leg) {
+  const short = leg.side === 'sell';
+  const pnl = `<b class="${cls(leg.price_pnl_usdt)}">${pnlUsd(leg.price_pnl_usdt)}</b>`;
+  return `<div class="leg-card">
+    <div class="top"><span class="venue">${esc(leg.venue)}</span><span class="side-pill ${short ? 'short' : 'long'}">${short ? '空' : '多'}</span></div>
+    <div class="kv"><span>数量</span><span>${qtyText(leg.quantity)}</span></div>
+    <div class="kv"><span>开仓均价</span><span>${price(leg.entry_price)}</span></div>
+    <div class="kv"><span>平仓均价</span><span>${price(leg.exit_price)}</span></div>
+    <div class="kv"><span>${short ? '空腿小计' : '多腿小计'}</span><span>价格盈亏 ${pnl} − 手续费 ${usd(leg.fee_usdt, 4)}</span></div>
+  </div>`;
+}
+
+function closedDetailRow(p) {
+  const legs = p.settled_legs || [];
+  const note = `${p.note || ''}${p.pnl_unattributed ? ` 实际盈亏没能核出：${p.pnl_unattributed}` : ''}`;
+  const funding = p.realized_funding_usdt;
+  const net = num(p.realized_pnl_usdt) - num(p.realized_fee_usdt) + (funding == null ? 0 : num(funding));
+  const totals = `<span>两腿价格盈亏 <b class="${cls(p.realized_pnl_usdt)}">${pnlUsd(p.realized_pnl_usdt)}</b></span>
+      <span>手续费合计 <b>−${usd(p.realized_fee_usdt, 4)}</b></span>
+      <span>资金费 <b class="${cls(funding)}">${funding == null ? '没查到' : pnlUsd(funding)}</b>${funding == null ? ' <span class="muted">不含资金费</span>' : ''}</span>
+      <span>已实现净额 <b class="${cls(net)}">${pnlUsd(net)}</b></span>`;
+  return `<tr class="closed-detail"><td colspan="8"><div class="closed-detail-box">
+    <div class="closed-kicker"><b>${esc(p.id)}</b><span>${esc(p.symbol)}</span><span class="pill status"${p.closed_externally ? ' title="人工外部处理"' : ''}>${esc(closedStatusText(p))}</span><span class="muted">${p.long || p.short ? '' : '两腿已退出 · '}开仓 ${when(p.opened_at)} · 结束 ${when(p.closed_at)}</span></div>
+    ${note ? `<p class="closed-note">${esc(note)}</p>` : ''}
+    <h4>入账时记下的成交</h4>
+    ${legs.length ? `<div class="legs-grid">${legs.map(closedLegCard).join('')}</div><div class="pnl-row">${totals}</div>` : '<p class="muted">入账时没记下分腿成交。</p>'}
+  </div></td></tr>`;
+}
+
 function renderClosedPositions() {
   const wrap = $('pos-closed-wrap');
   if (!wrap) return;
@@ -2814,20 +2872,28 @@ function renderClosedPositions() {
   }
   const closed = data.closed || [];
   $('pos-closed').innerHTML = closed
-    .map(
-      (p) => `<tr>
+    .map((p) => {
+      const open = state.pos.closedId === p.id;
+      return `<tr class="${open ? 'open' : ''}" data-closed="${esc(p.id)}" title="点击查看入账时记下的成交">
         <td class="dim">${esc(p.id)}</td>
         <td>${esc(p.symbol)}${p.origin === 'manual' ? ' <span class="tag">手动</span>' : ''}</td>
         <td>${p.long || p.short ? legsText(p.long?.venue, p.short?.venue) : '<span class="muted">两腿已退出</span>'}</td>
-        <td><span class="pill status">${p.closed_externally ? '人工外部处理' : (STATUS_LABEL[p.status] || esc(p.status))}</span></td>
+        <td><span class="pill status"${p.closed_externally ? ' title="人工外部处理"' : ''}>${esc(closedStatusText(p))}</span></td>
         <td class="dim">${when(p.opened_at)}</td>
         <td class="dim">${when(p.closed_at)}</td>
         <td class="num">${realizedCell(p)}</td>
         <td class="small">${esc(p.note || '')}${p.pnl_unattributed ? esc(` 实际盈亏没能核出：${p.pnl_unattributed}`) : ''}</td>
-      </tr>`,
-    )
+      </tr>${open ? closedDetailRow(p) : ''}`;
+    })
     .join('');
   $('pos-closed-empty').textContent = closed.length ? '' : '还没有结束的仓位。';
+  $('pos-closed').onclick = (event) => {
+    const row = event.target.closest('tr[data-closed]');
+    if (!row) return;
+    const id = row.getAttribute('data-closed');
+    state.pos.closedId = state.pos.closedId === id ? null : id;
+    renderClosedPositions();
+  };
 }
 
 // ───────────────────────────── 价差监控（RH 价差页） ─────────────────────────────

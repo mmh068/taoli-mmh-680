@@ -1,7 +1,8 @@
 //! 跨场所同名合约价差监控（只读，不下单；自动交易见 `rh_auto`）。
 //!
 //! 最早只做 Lighter RH ↔ Arcus（都在 Robinhood Chain 上、都用 USDG 保证金）；现在按**组**监控，
-//! 支持 Arcus、Lighter RH、Hyperliquid 主 dex 与 HIP-3 xyz / io 任意两家（`ARB_RH_SPREAD_PAIRS`）。
+//! 支持 Arcus、Lighter RH、Hyperliquid 主 dex 与 HIP-3 xyz / io 任意两家。
+//! `ARB_RH_SPREAD_EXCLUDE` 只从这些组里拿掉场所，不关实盘连接，也不平已有仓位。
 //! 价格偶尔会偏离：一边比另一边贵出手续费加穿价以上。这里：
 //!
 //! 1. 用各家的行情 WebSocket 维护本地盘口（REST 轮询会打穿 Lighter RH 的 IP 限频，
@@ -60,7 +61,7 @@ pub struct Config {
     /// 排除 Lighter RH 与 Hyperliquid 分类名单里的 Pre-IPO 合约。
     pub exclude_preipo: bool,
     pub dir: PathBuf,
-    /// 监控哪几组（`ARB_RH_SPREAD_PAIRS`）。
+    /// 监控哪几组。默认按实盘场所两两组合，`ARB_RH_SPREAD_EXCLUDE` 再拿掉场所。
     pub pairs: Vec<Pair>,
     /// Entropy（`hyperliquid-io`）自返佣（`ARB_ENTROPY_SELF_REBATE`，2 = 200%）。
     pub entropy_rebate: Decimal,
@@ -115,16 +116,31 @@ impl Config {
                 Some("1" | "on" | "true")
             ),
             dir: var("ARB_RH_SPREAD_DIR").map_or_else(|| PathBuf::from("rh-spread"), PathBuf::from),
-            pairs: match var("ARB_RH_SPREAD_PAIRS") {
-                Some(raw) => Pair::parse_list(&raw)
-                    .map_err(|error| anyhow::anyhow!("ARB_RH_SPREAD_PAIRS：{error}"))?,
-                // 没指定：用户配了 API 的场所（与实盘同一套凭据识别，不联网）两两组合。
-                None => default_pairs(),
-            },
+            pairs: monitored_pairs(&var)?,
             entropy_rebate: arb_venues::hyperliquid::entropy_self_rebate_from_env()
                 .map_err(|error| anyhow::anyhow!("{error}"))?,
         })
     }
+}
+
+/// 监控组。先按实盘场所两两组合，再按 `ARB_RH_SPREAD_EXCLUDE` 拿掉场所。
+/// 拿掉之后没有组就报错，不要悄悄监一个空名单。
+fn monitored_pairs(var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Vec<Pair>> {
+    let pairs = match var("ARB_RH_SPREAD_PAIRS") {
+        Some(raw) => Pair::parse_list(&raw)
+            .map_err(|error| anyhow::anyhow!("ARB_RH_SPREAD_PAIRS：{error}"))?,
+        None => default_pairs(),
+    };
+    let Some(raw) = var("ARB_RH_SPREAD_EXCLUDE") else {
+        return Ok(pairs);
+    };
+    let excluded = pairs::parse_excluded(&raw)
+        .map_err(|error| anyhow::anyhow!("ARB_RH_SPREAD_EXCLUDE：{error}"))?;
+    let pairs = pairs::without_venues(&pairs, &excluded);
+    if pairs.is_empty() {
+        anyhow::bail!("ARB_RH_SPREAD_EXCLUDE 排除之后没有可监控的组");
+    }
+    Ok(pairs)
 }
 
 /// 默认的组：按凭据识别出的实盘场所（`ARB_LIVE_VENUES` 或自动识别）里价差监控支持的，两两组合。

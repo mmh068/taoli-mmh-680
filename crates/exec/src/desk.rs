@@ -27,7 +27,7 @@ use crate::monitor::{
     exit_quote, funding_exit_triggered, take_profit_triggered,
 };
 use crate::preflight::{Limits, Plan, Preflight, plan};
-use crate::reconcile::{Reconciliation, reconcile};
+use crate::reconcile::{DivergenceKind, Reconciliation, reconcile};
 use crate::types::{OrderState, OrderStatus, PairPosition, PositionStatus, Strategy, TaskRules};
 use crate::{Executor, PositionSetup};
 
@@ -1459,6 +1459,109 @@ fn leg_with_margin(position: &PairPosition, mut leg: crate::LegFill) -> crate::L
 
 const MANUAL_EXTERNAL: &str = "人工外部处理";
 
+fn known_external_reason(note: &str) -> Option<&'static str> {
+    if note.contains("第一腿") && note.contains("结果不明") {
+        return Some("第一腿成交不明，开仓中断，已在交易所手平");
+    }
+    if note.contains("第二腿") && note.contains("结果不明") {
+        return Some("第二腿成交不明，已在交易所手平");
+    }
+    if note.contains("回滚未完全成功") || note.contains("回滚没完成") {
+        return Some("回滚没完成，已在交易所手平");
+    }
+    if note.contains("剩下的腿") {
+        return Some("平仓中断，剩下的腿已在交易所手平");
+    }
+    if note.contains("平仓没走完") || note.contains("平仓未完成") {
+        return Some("平仓没走完，已在交易所手平");
+    }
+    if note.contains("两腿成交没记上") {
+        return Some("两腿成交没记上，已在交易所手平");
+    }
+    if note.contains("第一腿成交没记上") {
+        return Some("第一腿成交没记上，开仓中断，已在交易所手平");
+    }
+    if note.contains("只剩一条腿") {
+        return Some("只剩一条腿，已在交易所手平");
+    }
+    if note.contains("只成一条腿") || note.contains("只记下一条腿") {
+        return Some("只成一条腿，已在交易所手平");
+    }
+    if note.contains("没记下腿") {
+        return Some("开仓中断，成交没记上，已在交易所手平");
+    }
+    if note.contains("持仓已在交易所手平") || note.contains("在交易所外部平仓") {
+        return Some("持仓已在交易所手平");
+    }
+    None
+}
+
+/// 已经写过的短原因。旧的长备注含「核对 / 对账 / 稍后」，不算。
+fn external_reason_kept(note: &str) -> Option<&str> {
+    let rest = note.strip_prefix("人工外部处理：")?;
+    let reason = rest.split(['；', '。']).next()?.trim();
+    if reason.is_empty()
+        || reason.contains("核对")
+        || reason.contains("对账")
+        || reason.contains("稍后")
+    {
+        return None;
+    }
+    Some(reason)
+}
+
+fn filled_open_side_count(replayed: &Replayed, position: &PairPosition) -> usize {
+    let prefix = position_order_prefix(&position.id);
+    let mut buy = false;
+    let mut sell = false;
+    for order in replayed.orders.values() {
+        if !order.order.client_order_id.0.starts_with(&prefix)
+            || order.order.symbol != position.symbol
+            || order.order.reduce_only
+            || order.filled_usdt <= Decimal::ZERO
+        {
+            continue;
+        }
+        match order.order.side {
+            Side::Buy => buy = true,
+            Side::Sell => sell = true,
+        }
+    }
+    usize::from(buy) + usize::from(sell)
+}
+
+/// 人工外部处理的短原因。先看原备注里的起因，再看仓位和订单。
+fn manual_external_reason(position: &PairPosition, replayed: &Replayed) -> &'static str {
+    let note = position.note.as_deref().unwrap_or("");
+    if note.contains("结果不明") || note.contains("回滚") {
+        if let Some(reason) = known_external_reason(note) {
+            return reason;
+        }
+    }
+    let orphan = position.status == PositionStatus::Opening
+        && position.long.is_none()
+        && position.short.is_none();
+    let one_recorded = !orphan && position.long.is_some() != position.short.is_some();
+    if orphan {
+        return match filled_open_side_count(replayed, position) {
+            2 => "两腿成交没记上，已在交易所手平",
+            _ => "第一腿成交没记上，开仓中断，已在交易所手平",
+        };
+    }
+    if one_recorded {
+        return match position.status {
+            PositionStatus::Closing => "平仓中断，剩下的腿已在交易所手平",
+            PositionStatus::Opening => "只成一条腿，开仓中断，已在交易所手平",
+            _ => "只剩一条腿，已在交易所手平",
+        };
+    }
+    if position.status == PositionStatus::Closing {
+        "平仓没走完，已在交易所手平"
+    } else {
+        "持仓已在交易所手平"
+    }
+}
+
 /// 判断哪些仓位是在交易所被外部（手动）平掉的。**纯判断，不下单、不改台账。**
 ///
 /// 只在下面全部成立时才建议结束一笔仓位：
@@ -1701,6 +1804,7 @@ pub async fn adopt_external_closes(
     exposed: &[&PairPosition],
     ids: &[String],
 ) -> Result<Vec<PairPosition>> {
+    let (replayed, _) = ledger.replay().await?;
     let mut adopted = Vec::new();
     for id in ids {
         let Some(position) = exposed.iter().find(|position| &position.id == id) else {
@@ -1711,6 +1815,7 @@ pub async fn adopt_external_closes(
             && position.long.is_none()
             && position.short.is_none();
         let one_recorded = !orphan && position.long.is_some() != position.short.is_some();
+        let reason = manual_external_reason(&position, &replayed);
         // 腿在下面会被清掉：先把开仓记录存下来，事后按成交核算实际盈亏要用。
         if position.entry_legs.is_none() {
             position.entry_legs = position
@@ -1720,7 +1825,6 @@ pub async fn adopt_external_closes(
                 .map(|(long, short)| crate::EntryLegs { long, short });
         }
         if position.entry_legs.is_none() {
-            let (replayed, _) = ledger.replay().await?;
             let legs = filled_open_legs(&replayed, &position);
             if let (Some(long), Some(short)) = (
                 legs.iter().find(|leg| leg.side == Side::Buy).cloned(),
@@ -1754,33 +1858,8 @@ pub async fn adopt_external_closes(
             )
             .await
         };
-        let funding_known = funding.is_some();
-        let funding = funding.unwrap_or_default();
-        position.realized_funding_usdt = funding_known.then_some(funding);
-        let funding_text = if funding_known {
-            format!(
-                " {} USDT（交易所结算流水）",
-                funding.round_dp(4).normalize()
-            )
-        } else {
-            "没有查到".into()
-        };
-        position.note = Some(if orphan {
-            format!(
-                "{MANUAL_EXTERNAL}：开仓中断、台账没记下腿，已在对应交易所核对开平仓（{} 对账确认账户已归零）。实际盈亏稍后按交易所成交记录核算；开仓以来资金费{funding_text}",
-                now.format("%Y-%m-%d %H:%M UTC"),
-            )
-        } else if one_recorded {
-            format!(
-                "{MANUAL_EXTERNAL}：只记下一条腿，对账确认这个合约在相关场所已经没有仓和挂单（{}）。实际盈亏稍后按交易所成交记录核算；开仓以来资金费{funding_text}",
-                now.format("%Y-%m-%d %H:%M UTC"),
-            )
-        } else {
-            format!(
-                "在交易所外部平仓：{} 对账发现两腿都已没有仓位，台账据此结束这笔。实际盈亏稍后按交易所的成交记录核算；开仓以来资金费{funding_text}",
-                now.format("%Y-%m-%d %H:%M UTC"),
-            )
-        });
+        position.realized_funding_usdt = funding;
+        position.note = Some(format!("{MANUAL_EXTERNAL}：{reason}"));
         position.long = None;
         position.short = None;
         position.status = PositionStatus::Closed;
@@ -2341,29 +2420,33 @@ pub async fn settle_closed_from_fills(
     settled.realized_funding_usdt = funding;
     settled.realized_source = Some(crate::RealizedSource::VenueFills);
     settled.pnl_unattributed = None;
-    let manual = position
-        .note
-        .as_deref()
-        .is_some_and(|note| note.starts_with(MANUAL_EXTERNAL));
-    let unrecorded = position
-        .note
-        .as_deref()
-        .is_some_and(|note| note.contains("没记下腿"));
-    settled.note = Some(if manual && unrecorded {
-        format!(
-            "{MANUAL_EXTERNAL}：开仓中断、台账没记下腿，已在对应交易所核对开平仓（{}）；{described}",
-            until.format("%Y-%m-%d %H:%M UTC"),
-        )
-    } else if manual {
-        format!(
-            "{MANUAL_EXTERNAL}：只记下一条腿，已在对应交易所核对开平仓（{}）；{described}",
-            until.format("%Y-%m-%d %H:%M UTC"),
-        )
-    } else if position.is_external_close() {
-        format!(
-            "在交易所外部平仓（{} 对账发现两腿都已没有仓位）；{described}",
-            until.format("%Y-%m-%d %H:%M UTC"),
-        )
+    settled.settled_legs = settled_legs
+        .iter()
+        .map(|leg| crate::types::SettledLeg {
+            venue: leg.venue,
+            side: leg.side,
+            quantity: leg.quantity,
+            entry_price: leg.entry_price,
+            exit_price: leg.exit_price,
+            price_pnl_usdt: leg.price_pnl_usdt,
+            fee_usdt: leg.fees_usdt,
+        })
+        .collect();
+    settled.note = Some(if position.is_external_close() {
+        let reason = position
+            .note
+            .as_deref()
+            .and_then(external_reason_kept)
+            .map(str::to_string)
+            .or_else(|| {
+                position
+                    .note
+                    .as_deref()
+                    .and_then(known_external_reason)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "持仓已在交易所手平".into());
+        format!("{MANUAL_EXTERNAL}：{reason}；{described}")
     } else {
         format!(
             "已平仓（{}）；{described}",
@@ -3096,7 +3179,23 @@ fn order_belongs_to(client_order_id: &str, position_ids: &BTreeSet<String>) -> b
     })
 }
 
-/// 这次对账里受牵连的敞口仓位。只看还有敞口的仓位，不翻已结束的历史。
+fn position_owning_order<'a>(replayed: &'a Replayed, order_id: &str) -> Option<&'a PairPosition> {
+    replayed
+        .positions
+        .values()
+        .filter(|position| order_belongs_to_one(order_id, &position.id))
+        .max_by_key(|position| position.id.len())
+}
+
+fn order_belongs_to_one(client_order_id: &str, position_id: &str) -> bool {
+    let ids = BTreeSet::from([position_id.to_string()]);
+    order_belongs_to(client_order_id, &ids)
+}
+
+/// 这次对账里要放进待核实名单的仓位。
+///
+/// 还有敞口、并且规则被挡住的仓位照旧收录。订单对不上时，不论仓位是否已经结束，
+/// 只要订单号能对上仓位，也收录。已经有更具体原因的不覆盖。
 pub fn implicated_position_ids(
     replayed: &Replayed,
     recon: &Reconciliation,
@@ -3112,6 +3211,19 @@ pub fn implicated_position_ids(
     for id in opening_ids_with_unrecorded_fills(replayed) {
         out.entry(id)
             .or_insert_with(|| "开仓中断，台账没记下腿，要到对应交易所核实".into());
+    }
+    for divergence in &recon.divergences {
+        if !matches!(
+            divergence.kind,
+            DivergenceKind::OrderMissingOnVenue | DivergenceKind::UnknownOpenOrder
+        ) {
+            continue;
+        }
+        let Some(position) = position_owning_order(replayed, &divergence.reference) else {
+            continue;
+        };
+        out.entry(position.id.clone())
+            .or_insert_with(|| format!("这笔订单对不上：{}", divergence.detail));
     }
     out
 }
@@ -3752,6 +3864,7 @@ mod tests {
                 open_report: None,
                 planned_long: None,
                 planned_short: None,
+                settled_legs: Vec::new(),
                 origin: None,
             }
         }
@@ -4003,6 +4116,7 @@ mod tests {
                 open_report: None,
                 planned_long: None,
                 planned_short: None,
+                settled_legs: Vec::new(),
                 origin: None,
             }
         }
@@ -4383,7 +4497,7 @@ mod tests {
             assert_eq!(adopted.len(), 1);
             let note = adopted[0].note.clone().unwrap();
             assert!(
-                note.contains("在交易所外部平仓") && note.contains("稍后按交易所的成交记录核算"),
+                note.starts_with("人工外部处理") && note.contains("持仓已在交易所手平"),
                 "{note}"
             );
             // 台账回放：已平仓、没有敞口；再对账，这笔不再有任何不一致。
@@ -4446,7 +4560,8 @@ mod tests {
             assert_eq!(adopted.len(), 1);
             let note = adopted[0].note.clone().unwrap();
             assert!(
-                note.starts_with("人工外部处理") && note.contains("核对开平仓"),
+                note.starts_with("人工外部处理")
+                    && note.contains("第一腿成交没记上，开仓中断，已在交易所手平"),
                 "{note}"
             );
             assert!(adopted[0].closed_externally);
@@ -4454,6 +4569,48 @@ mod tests {
             let (replayed, _) = ledger.replay().await.unwrap();
             assert!(replayed.exposed().is_empty());
             let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[test]
+        fn each_external_close_names_its_cause() {
+            let replayed = Replayed {
+                orders: std::collections::HashMap::new(),
+                positions: std::collections::HashMap::new(),
+            };
+            let mut opening = position(PositionStatus::Opening);
+            opening.long = None;
+            opening.short = None;
+            opening.note = Some("第一腿（lighter-rh 多）结果不明：超时".into());
+            assert_eq!(
+                manual_external_reason(&opening, &replayed),
+                "第一腿成交不明，开仓中断，已在交易所手平"
+            );
+            opening.note = Some("第二腿（arcus 空）结果不明：超时".into());
+            opening.long = Some(leg(Venue::LighterRh, Side::Buy, dec!(1)));
+            assert_eq!(
+                manual_external_reason(&opening, &replayed),
+                "第二腿成交不明，已在交易所手平"
+            );
+            opening.note = Some("回滚未完全成功，仍有敞口：lighter-rh 超时".into());
+            assert_eq!(
+                manual_external_reason(&opening, &replayed),
+                "回滚没完成，已在交易所手平"
+            );
+            let mut naked = position(PositionStatus::Open);
+            naked.short = None;
+            assert_eq!(
+                manual_external_reason(&naked, &replayed),
+                "只剩一条腿，已在交易所手平"
+            );
+            let closing = position(PositionStatus::Closing);
+            assert_eq!(
+                manual_external_reason(&closing, &replayed),
+                "平仓没走完，已在交易所手平"
+            );
+            assert_eq!(
+                manual_external_reason(&position(PositionStatus::Open), &replayed),
+                "持仓已在交易所手平"
+            );
         }
     }
 
@@ -4606,6 +4763,7 @@ mod tests {
                 open_report: None,
                 planned_long: None,
                 planned_short: None,
+                settled_legs: Vec::new(),
                 origin: None,
             }
         }
@@ -5868,6 +6026,7 @@ mod tests {
                 open_report: None,
                 planned_long: None,
                 planned_short: None,
+                settled_legs: Vec::new(),
                 origin: None,
             }
         }
@@ -6227,6 +6386,7 @@ mod tests {
                 open_report: None,
                 planned_long: None,
                 planned_short: None,
+                settled_legs: Vec::new(),
                 origin: None,
             }
         }
@@ -6749,6 +6909,7 @@ mod tests {
                 open_report: None,
                 planned_long: Some(Venue::LighterRh),
                 planned_short: Some(Venue::Arcus),
+                settled_legs: Vec::new(),
                 origin: None,
             }
         }
@@ -7384,6 +7545,45 @@ mod tests {
                 ids.get("live-1").map(String::as_str),
                 Some("开仓中断，台账没记下腿，要到对应交易所核实")
             );
+        }
+
+        #[test]
+        fn a_closed_position_whose_order_is_missing_on_the_venue_is_queued() {
+            let mut position = opening();
+            position.status = PositionStatus::Closed;
+            let order_id = crate::types::ClientOrderId::for_leg(
+                &position.id,
+                arb_core::Side::Sell,
+                0,
+            );
+            let mut replayed = Replayed::default();
+            replayed
+                .positions
+                .insert(position.id.clone(), position.clone());
+            let recon = Reconciliation {
+                divergences: vec![crate::reconcile::Divergence {
+                    kind: crate::reconcile::DivergenceKind::OrderMissingOnVenue,
+                    venue: Some(Venue::Hyperliquid),
+                    reference: order_id.0,
+                    detail: "本地记着这笔挂单，交易所那边已经不在场上了".into(),
+                }],
+                ..Reconciliation::default()
+            };
+            let ids = implicated_position_ids(&replayed, &recon);
+            assert_eq!(
+                ids.get("live-1").map(String::as_str),
+                Some("这笔订单对不上：本地记着这笔挂单，交易所那边已经不在场上了")
+            );
+
+            let mut unrelated = Reconciliation::default();
+            unrelated.divergences.push(crate::reconcile::Divergence {
+                kind: crate::reconcile::DivergenceKind::UnknownOpenOrder,
+                venue: Some(Venue::Hyperliquid),
+                reference: "other-sell-0".into(),
+                detail: "交易所有一笔本地台账不知道的挂单".into(),
+            });
+            assert!(implicated_position_ids(&replayed, &unrelated).is_empty());
+            let _ = position;
         }
     }
 }

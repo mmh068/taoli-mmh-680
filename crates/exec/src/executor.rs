@@ -314,6 +314,7 @@ impl Executor {
             open_report: None,
             planned_long: Some(plan.long.venue),
             planned_short: Some(plan.short.venue),
+            settled_legs: Vec::new(),
             origin: setup.origin.clone(),
         };
         self.persist(&position).await?;
@@ -690,11 +691,9 @@ impl Executor {
                 ));
             };
             let kept = (Decimal::ONE - filled_quantity / quantity).max(Decimal::ZERO);
-            let realized = match leg.side {
-                Side::Buy => filled_quantity * (fill_price - leg.average_price),
-                Side::Sell => filled_quantity * (leg.average_price - fill_price),
-            };
             // 减掉部分的价格盈亏计入已实现；手续费留在腿上，腿完全平掉时一并结算。
+            let realized =
+                position.book_exit_fill(&leg, filled_quantity, fill_price, fee, false);
             position.realized_pnl_usdt += realized;
             let updated = LegFill {
                 notional_usdt: leg.notional_usdt * kept,
@@ -799,22 +798,24 @@ impl Executor {
                 .average_price
                 .filter(|price| *price > Decimal::ZERO)
                 .map_or(Decimal::ZERO, |price| state.filled_usdt / price);
+            let done = state.status == OrderStatus::Filled && filled > Decimal::ZERO;
+            // 入场价在腿被移除之前取：这一笔成交的价格盈亏当场入账，分腿明细同时记下。
+            let entry = match side {
+                Side::Sell => position.long.clone(),
+                Side::Buy => position.short.clone(),
+            };
+            if let (Some(leg), Some(price)) = (entry, state.average_price)
+                && filled > Decimal::ZERO
+            {
+                let pnl = position.book_exit_fill(&leg, filled, price, state.fee_usdt, done);
+                position.realized_pnl_usdt += pnl;
+                exits.push((side, price));
+            }
             // 平多腿是卖、平空腿是买。
             let slot = match side {
                 Side::Sell => &mut position.long,
                 Side::Buy => &mut position.short,
             };
-            let done = state.status == OrderStatus::Filled && filled > Decimal::ZERO;
-            // 入场价在腿被移除之前取：这一笔成交的价格盈亏当场入账。
-            if let (Some(leg), Some(price)) = (slot.as_ref(), state.average_price)
-                && filled > Decimal::ZERO
-            {
-                position.realized_pnl_usdt += match side {
-                    Side::Sell => filled * (price - leg.average_price),
-                    Side::Buy => filled * (leg.average_price - price),
-                };
-                exits.push((side, price));
-            }
             if done {
                 if let Some(leg) = slot.take() {
                     position.realized_fee_usdt += leg.fee_usdt + state.fee_usdt;
@@ -1588,6 +1589,7 @@ mod tests {
             open_report: None,
             planned_long: None,
             planned_short: None,
+            settled_legs: Vec::new(),
             origin: None,
         };
         executor.close(&mut position).await.unwrap();
@@ -1647,6 +1649,7 @@ mod tests {
             open_report: None,
             planned_long: None,
             planned_short: None,
+            settled_legs: Vec::new(),
             origin: None,
         };
 
@@ -1746,6 +1749,7 @@ mod tests {
             open_report: None,
             planned_long: None,
             planned_short: None,
+            settled_legs: Vec::new(),
             origin: None,
         };
 
@@ -1944,6 +1948,7 @@ mod tests {
             open_report: None,
             planned_long: None,
             planned_short: None,
+            settled_legs: Vec::new(),
             origin: None,
         };
 
@@ -2507,6 +2512,7 @@ mod tests {
             open_report: None,
             planned_long: None,
             planned_short: None,
+            settled_legs: Vec::new(),
             origin: None,
         }
     }

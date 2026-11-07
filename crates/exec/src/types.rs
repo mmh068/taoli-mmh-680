@@ -435,6 +435,21 @@ pub struct PairPosition {
     /// 开仓计划的空头场所。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_short: Option<Venue>,
+    /// 计入已实现盈亏时记下的分腿成交。旧台账没有，不事后倒推。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settled_legs: Vec<SettledLeg>,
+}
+
+/// 一条腿在入账那一刻的开平仓。页面只读这个，不再另算。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettledLeg {
+    pub venue: Venue,
+    pub side: Side,
+    pub quantity: Decimal,
+    pub entry_price: Decimal,
+    pub exit_price: Decimal,
+    pub price_pnl_usdt: Decimal,
+    pub fee_usdt: Decimal,
 }
 
 /// 已实现盈亏的出处。
@@ -455,6 +470,63 @@ pub struct EntryLegs {
 }
 
 impl PairPosition {
+    /// 把已经计入已实现盈亏的一笔退出成交并进分腿记录，返回这一笔的价格盈亏。
+    ///
+    /// `done` 时补上还留在腿上的开仓费（减仓费如果先前已经记过，不会再加一遍）。
+    pub fn book_exit_fill(
+        &mut self,
+        leg: &LegFill,
+        filled: Decimal,
+        exit_price: Decimal,
+        exit_fee: Decimal,
+        done: bool,
+    ) -> Decimal {
+        if filled <= Decimal::ZERO || exit_price <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let price_pnl = match leg.side {
+            Side::Buy => filled * (exit_price - leg.average_price),
+            Side::Sell => filled * (leg.average_price - exit_price),
+        };
+        let already = self
+            .settled_legs
+            .iter()
+            .find(|row| row.venue == leg.venue && row.side == leg.side)
+            .map(|row| row.fee_usdt)
+            .unwrap_or_default();
+        let open_fee = if done {
+            (leg.fee_usdt - already).max(Decimal::ZERO)
+        } else {
+            Decimal::ZERO
+        };
+        let fee = exit_fee + open_fee;
+        if let Some(existing) = self
+            .settled_legs
+            .iter_mut()
+            .find(|row| row.venue == leg.venue && row.side == leg.side)
+        {
+            let total = existing.quantity + filled;
+            if total > Decimal::ZERO {
+                existing.exit_price =
+                    (existing.exit_price * existing.quantity + exit_price * filled) / total;
+            }
+            existing.quantity = total;
+            existing.price_pnl_usdt += price_pnl;
+            existing.fee_usdt += fee;
+            return price_pnl;
+        }
+        self.settled_legs.push(SettledLeg {
+            venue: leg.venue,
+            side: leg.side,
+            quantity: filled,
+            entry_price: leg.average_price,
+            exit_price,
+            price_pnl_usdt: price_pnl,
+            fee_usdt: fee,
+        });
+        price_pnl
+    }
+
     /// 是不是在交易所被外部（手动）平掉、台账事后才发现的。更早版本识别出来的记录还没有
     /// `closed_externally` 字段，靠它写下的备注开头认。
     pub fn is_external_close(&self) -> bool {
@@ -613,6 +685,7 @@ mod tests {
             open_report: None,
             planned_long: None,
             planned_short: None,
+            settled_legs: Vec::new(),
             origin: None,
         };
         assert!(position.is_naked(), "两腿都没成交也是裸敞口");
@@ -673,6 +746,7 @@ mod tests {
             open_report: None,
             planned_long: None,
             planned_short: None,
+            settled_legs: Vec::new(),
             origin: None,
         };
         // 基差收敛到 0 → 赚 1%
@@ -681,6 +755,61 @@ mod tests {
         assert_eq!(position.basis_pnl_pct(dec!(1.0)), Decimal::ZERO);
         // 基差反向 → 亏
         assert_eq!(position.basis_pnl_pct(dec!(-1.0)), dec!(2.0));
+    }
+
+    #[test]
+    fn a_trim_then_a_full_exit_books_each_fill_once() {
+        let mut position = PairPosition {
+            margin_mode: crate::MarginMode::Isolated,
+            id: "p1".into(),
+            symbol: Symbol::perp("BTC", "USDT"),
+            strategy: Strategy::Spread,
+            long: None,
+            short: None,
+            entry_basis_pct: Decimal::ZERO,
+            expected_round_trip_cost: Decimal::ZERO,
+            status: PositionStatus::Open,
+            opened_at: Utc::now(),
+            closed_at: None,
+            note: None,
+            leverage: None,
+            rules: TaskRules::default(),
+            trims: 1,
+            exits: 0,
+            margin_added_usdt: Decimal::ZERO,
+            realized_pnl_usdt: Decimal::ZERO,
+            realized_fee_usdt: Decimal::ZERO,
+            realized_source: None,
+            realized_funding_usdt: None,
+            funding_checked_at: None,
+            closed_externally: false,
+            entry_legs: None,
+            pnl_unattributed: None,
+            open_report: None,
+            planned_long: None,
+            planned_short: None,
+            settled_legs: Vec::new(),
+            origin: None,
+        };
+        let leg = LegFill {
+            venue: Venue::Binance,
+            side: Side::Buy,
+            notional_usdt: dec!(1000),
+            average_price: dec!(100),
+            fee_usdt: dec!(0.4),
+            client_order_id: ClientOrderId::for_leg("p1", Side::Buy, 0),
+            margin_usdt: None,
+        };
+        position.book_exit_fill(&leg, dec!(4), dec!(101), dec!(0.1), false);
+        let mut later = leg.clone();
+        later.fee_usdt += dec!(0.1);
+        position.book_exit_fill(&later, dec!(6), dec!(102), dec!(0.2), true);
+        assert_eq!(position.settled_legs.len(), 1);
+        let booked = &position.settled_legs[0];
+        assert_eq!(booked.quantity, dec!(10));
+        assert_eq!(booked.price_pnl_usdt, dec!(16));
+        assert_eq!(booked.fee_usdt, dec!(0.7));
+        assert_eq!(booked.exit_price, dec!(101.6));
     }
 
     #[test]

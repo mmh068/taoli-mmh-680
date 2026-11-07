@@ -727,6 +727,11 @@ fn catalogs_keep_fees_honest_and_pairs_need_a_verified_identity() {
         Venue::HyperliquidXyz,
     ]);
     assert_eq!(all.len(), 10);
+    let excluded = pairs::parse_excluded("hyperliquid-xyz").unwrap();
+    let kept = pairs::without_venues(&all, &excluded);
+    assert!(kept.iter().all(|pair| pair.a != Venue::HyperliquidXyz && pair.b != Venue::HyperliquidXyz));
+    assert!(kept.iter().any(|pair| pair == &Pair::RH));
+    assert!(pairs::parse_excluded("hype-xyz").unwrap_err().contains("hyperliquid-xyz"));
     for (a, b) in [
         (Venue::Arcus, Venue::LighterRh),
         (Venue::HyperliquidXyz, Venue::LighterRh),

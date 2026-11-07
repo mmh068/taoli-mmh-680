@@ -47,6 +47,38 @@ pub fn all_pairs(venues: &[Venue]) -> Vec<Pair> {
     out
 }
 
+/// 从已选组里拿掉这些场所。任一腿命中就整组不要。
+pub fn without_venues(pairs: &[Pair], excluded: &[Venue]) -> Vec<Pair> {
+    pairs
+        .iter()
+        .copied()
+        .filter(|pair| !excluded.contains(&pair.a) && !excluded.contains(&pair.b))
+        .collect()
+}
+
+/// 逗号分隔的场所名。只接受价差监控支持的场所，拼错就报错。
+pub fn parse_excluded(raw: &str) -> Result<Vec<Venue>, String> {
+    let mut out = Vec::new();
+    for part in raw.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        let venue = Venue::parse(part)
+            .filter(|venue| SUPPORTED.contains(venue))
+            .ok_or_else(|| {
+                format!(
+                    "价差监控不支持排除场所 {part:?}（支持：{}）",
+                    SUPPORTED.map(Venue::as_str).join("、")
+                )
+            })?;
+        if out.contains(&venue) {
+            return Err(format!("场所 {part:?} 重复"));
+        }
+        out.push(venue);
+    }
+    if out.is_empty() {
+        return Err("至少要排除一家".into());
+    }
+    Ok(out)
+}
+
 /// 一组场所。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct Pair {
