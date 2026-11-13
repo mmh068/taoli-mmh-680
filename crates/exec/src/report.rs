@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::monitor::ExitQuote;
 use crate::preflight::{LegPlan, Plan};
 use crate::types::LegFill;
 
@@ -62,6 +63,41 @@ pub struct OpenReport {
     pub prepare_ms: i64,
     /// 执行器从开始到两腿都记完。
     pub total_ms: i64,
+}
+
+/// 平仓放行时已经算出的盘口预估。只抄 [`ExitQuote`]，不再另算。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CloseQuote {
+    pub long_price: Decimal,
+    pub short_price: Decimal,
+    pub exit_basis_pct: Decimal,
+    pub net_usdt: Decimal,
+}
+
+impl From<&ExitQuote> for CloseQuote {
+    fn from(quote: &ExitQuote) -> Self {
+        Self {
+            long_price: quote.long_price,
+            short_price: quote.short_price,
+            exit_basis_pct: quote.exit_basis_pct,
+            net_usdt: quote.net_usdt,
+        }
+    }
+}
+
+/// 平仓决定时已经在手的核对。没有核对过的平仓（手动、中断重试）不写。
+/// 成交价差不放这里：入账时的 [`crate::types::SettledLeg`] 已经有开平仓价。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CloseReport {
+    /// 放行时的规则原因。手动平仓没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 触发时的标记价基差（%）。缺标记价时没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark_basis_pct: Option<Decimal>,
+    /// 放行时按盘口算出的预估。手动平仓没有这份数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<CloseQuote>,
 }
 
 /// 计时用的时刻。`quoted_at` 是取盘口的时刻（`prepare` 里拉完两个盘口之后）。

@@ -59,7 +59,7 @@ pub use monitor::{
 };
 pub use preflight::{LegPlan, Limits, Plan, Preflight, Rejection, plan};
 pub use reconcile::{Divergence, DivergenceKind, Reconciliation, reconcile};
-pub use report::{LegExecution, OpenReport, OpenTiming, open_report};
+pub use report::{CloseQuote, CloseReport, LegExecution, OpenReport, OpenTiming, open_report};
 pub use types::{
     ClientOrderId, Fill, LegFill, MarginMode, NewOrder, OrderAck, OrderState, OrderStatus,
     PairPosition, PositionStatus, Strategy, TaskRules,

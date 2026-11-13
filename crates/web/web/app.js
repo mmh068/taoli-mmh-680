@@ -2854,6 +2854,20 @@ function closedFundingOnlyCard(funding) {
   </div>`;
 }
 
+function closeReviewHtml(report) {
+  if (!report) return '';
+  const missing = '<span class="muted">没记下</span>';
+  const quote = report.quote;
+  const book = quote
+    ? `多腿卖 ${price(quote.long_price)} · 空腿买回 ${price(quote.short_price)} · 平仓价差 ${pctRaw(quote.exit_basis_pct, 4)} · 预估净额 ${pnlUsd(quote.net_usdt)}`
+    : missing;
+  const row = (label, value) => `<div class="kv"><span>${label}</span><span>${value}</span></div>`;
+  return `<h4>平仓核对</h4>
+    ${row('原因', report.reason ? esc(report.reason) : missing)}
+    ${row('触发时标记价基差', report.mark_basis_pct == null ? missing : pctRaw(report.mark_basis_pct, 4))}
+    ${row('放行盘口', book)}`;
+}
+
 function closedDetailRow(p) {
   const legs = p.settled_legs || [];
   const fundingLegs = p.funding_legs || [];
@@ -2878,6 +2892,7 @@ function closedDetailRow(p) {
     ${note ? `<p class="closed-note">${esc(note)}</p>` : ''}
     <h4>入账时记下的成交</h4>
     ${body}
+    ${closeReviewHtml(p.close_report)}
   </div></td></tr>`;
 }
 

@@ -689,7 +689,7 @@ impl LiveDesk {
                 continue;
             }
             let ready = match desk::book_close_ready(&self.by_venue, &candidate.position).await {
-                Ok(Some(reason)) => reason,
+                Ok(Some(ready)) => ready,
                 Ok(None) => continue,
                 Err(error) => {
                     tracing::debug!(position = %candidate.id, "45 秒盘口没拉到，继续持有：{error:#}");
@@ -722,8 +722,13 @@ impl LiveDesk {
             }
             match desk::book_close_ready(&self.by_venue, &position).await {
                 Ok(Some(fresh)) => {
-                    info!(position = %position.id, "{ready}；占锁后复核：{fresh}");
-                    match self.executor().close(&mut position).await {
+                    info!(position = %position.id, "{}；占锁后复核：{}", ready.reason, fresh.reason);
+                    let checked = arb_exec::CloseReport {
+                        reason: Some(fresh.reason),
+                        mark_basis_pct: None,
+                        quote: Some(arb_exec::CloseQuote::from(&fresh.quote)),
+                    };
+                    match self.executor().close(&mut position, Some(checked)).await {
                         Ok(()) => self.exit_retries.succeeded(&position.id),
                         Err(error) => {
                             let failures = self.exit_retries.failed(&position.id, Instant::now());
@@ -4659,6 +4664,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),

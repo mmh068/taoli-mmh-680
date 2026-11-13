@@ -327,6 +327,7 @@ impl Executor {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: Some(plan.long.venue),
             planned_short: Some(plan.short.venue),
             settled_legs: Vec::new(),
@@ -542,7 +543,14 @@ impl Executor {
 
     /// 平掉一笔仓位。也用于重试停在 `Closing` / `Unwinding` 的仓位：已经退出的腿
     /// 不在仓位上了，只对剩下的敞口发单。
-    pub async fn close(&self, position: &mut PairPosition) -> ArbResult<()> {
+    ///
+    /// `checked` 是放行时已经在手的核对。手动平仓、中断重试没有，传 `None`。
+    /// 已经记过的不覆盖：重试不再另拉盘口。
+    pub async fn close(
+        &self,
+        position: &mut PairPosition,
+        checked: Option<crate::report::CloseReport>,
+    ) -> ArbResult<()> {
         // 一条腿都没记下的 `Opening`：开仓在第一腿成交前就中断了（进程在落盘意图之后、成交之前死掉）。
         // 它不是「平掉了一笔仓位」—— 按已平仓记会在当日盈亏里多出一笔盈亏为 0 的假交易。
         // 但订单有成交而仓位没记腿（死在「成交」与「写入仓位」之间）是台账之外的敞口，
@@ -568,6 +576,10 @@ impl Executor {
             return Ok(());
         }
         position.status = PositionStatus::Closing;
+        // 放行时的核对在第一次落盘前写上。平仓没走完会先落盘再返回，重试读回的是这份，不再另拉。
+        if position.close_report.is_none() {
+            position.close_report = checked;
+        }
         // 入场的两腿价格在退出后就从仓位上消失了：先记下来，备注里对比开平仓的成交价差。
         let entry_prices = position
             .long
@@ -1640,13 +1652,14 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
             origin: None,
         };
-        executor.close(&mut position).await.unwrap();
+        executor.close(&mut position, None).await.unwrap();
         assert_eq!(position.status, PositionStatus::Closed);
         let net = position.realized_pnl_usdt - position.realized_fee_usdt;
         assert!((net - dec!(-1.2949)).abs() < dec!(0.0001), "{net}");
@@ -1701,6 +1714,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),
@@ -1709,13 +1723,13 @@ mod tests {
         };
 
         // 10 个只卖出 4 个：不能标 Closed，剩下 6 个留在仓位上。
-        assert!(executor.close(&mut position).await.is_err());
+        assert!(executor.close(&mut position, None).await.is_err());
         assert_eq!(position.status, PositionStatus::Closing);
         assert!(position.closed_at.is_none());
         assert_eq!(position.long.as_ref().unwrap().quantity(), Some(dec!(6)));
 
         // 重试换新号、只卖剩下的 6 个。
-        executor.close(&mut position).await.unwrap();
+        executor.close(&mut position, None).await.unwrap();
         assert_eq!(position.status, PositionStatus::Closed);
         assert!(position.long.is_none());
 
@@ -1802,6 +1816,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),
@@ -2002,6 +2017,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),
@@ -2569,6 +2585,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),
@@ -2585,7 +2602,7 @@ mod tests {
         let executor = Executor::new(Arc::clone(&ledger), vec![]);
         let mut position = bare_position("nt-1", PositionStatus::Opening);
 
-        executor.close(&mut position).await.unwrap();
+        executor.close(&mut position, None).await.unwrap();
 
         assert_eq!(position.status, PositionStatus::Unwound);
         assert!(position.closed_at.is_some());
@@ -2624,7 +2641,7 @@ mod tests {
         let executor = Executor::new(Arc::clone(&ledger), vec![]);
         let mut position = bare_position("fl-1", PositionStatus::Opening);
 
-        let result = executor.close(&mut position).await;
+        let result = executor.close(&mut position, None).await;
 
         assert!(result.is_err(), "有成交而没有腿：必须报错，不能当成没事");
         assert_eq!(position.status, PositionStatus::Opening);

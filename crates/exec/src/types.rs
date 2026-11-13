@@ -433,6 +433,9 @@ pub struct PairPosition {
     /// 开仓时计划与实际成交的对照、各步耗时（见 [`crate::report`]）。旧台账、回滚掉的仓位没有。
     #[serde(default)]
     pub open_report: Option<crate::report::OpenReport>,
+    /// 平仓放行时已经在手的核对。旧台账、没核对过就平的仓位没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_report: Option<crate::report::CloseReport>,
     /// 谁开的。旧台账没有这个字段，显示为自动。手动信号开的标成 `manual`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -700,6 +703,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),
@@ -762,6 +766,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),
@@ -805,6 +810,7 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            close_report: None,
             planned_long: None,
             planned_short: None,
             settled_legs: Vec::new(),

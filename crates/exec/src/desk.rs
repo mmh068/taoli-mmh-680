@@ -23,8 +23,8 @@ use crate::cli::{
 };
 use crate::ledger::{Ledger, Record, Replayed};
 use crate::monitor::{
-    Action, Evaluation, ExitCheck, Inputs, MIN_TOP_UP_USDT, basis_exit_triggered, evaluate_full,
-    exit_quote, funding_exit_triggered, take_profit_triggered,
+    Action, Evaluation, ExitCheck, ExitQuote, Inputs, MIN_TOP_UP_USDT, basis_exit_triggered,
+    evaluate_full, exit_quote, funding_exit_triggered, take_profit_triggered,
 };
 use crate::preflight::{Limits, Plan, Preflight, plan};
 use crate::reconcile::{DivergenceKind, Reconciliation, reconcile};
@@ -2766,7 +2766,7 @@ pub async fn close(
         bail!("仓位 {position_id} 已是 {:?}，没有敞口", position.status);
     }
     let error = executor
-        .close(&mut position)
+        .close(&mut position, None)
         .await
         .err()
         .map(|error| error.to_string());
@@ -2987,7 +2987,14 @@ async fn run_exit_action(
     action: &Action,
 ) -> Option<ArbResult<()>> {
     match action {
-        Action::Close { .. } => Some(executor.close(position).await),
+        Action::Close { reason } => {
+            let report = crate::report::CloseReport {
+                reason: Some(reason.clone()),
+                mark_basis_pct: observation.current_basis_pct,
+                quote: observation.exit.as_ref().map(crate::report::CloseQuote::from),
+            };
+            Some(executor.close(position, Some(report)).await)
+        }
         Action::Trim { fraction, reason } => {
             match (observation.long.mark_price, observation.short.mark_price) {
                 (Some(long_mark), Some(short_mark)) => Some(
@@ -3437,7 +3444,7 @@ pub async fn live_round(
             continue;
         }
         report.executed = true;
-        let outcome = executor.close(&mut position).await;
+        let outcome = executor.close(&mut position, None).await;
         match &outcome {
             Ok(()) => retries.succeeded(&position.id),
             Err(_) => {
@@ -3494,12 +3501,18 @@ pub fn exit_candidates(positions: &[PairPosition], report: &ScanReport) -> Vec<E
     out
 }
 
+/// 45 秒核对已经拉到的盘口。原因给人看，预估原样留给平仓记录，不再另算。
+pub struct BookClose {
+    pub reason: String,
+    pub quote: ExitQuote,
+}
+
 /// 按现拉盘口判断这笔能不能平。只读，不占交易台、不写台账。
-/// `Ok(Some(原因))` 才可以平；`Ok(None)` 是继续持有；`Err` 是盘口没拉到。
+/// `Ok(Some(_))` 才可以平；`Ok(None)` 是继续持有；`Err` 是盘口没拉到。
 pub async fn book_close_ready(
     by_venue: &HashMap<Venue, Arc<dyn VenueApi>>,
     position: &PairPosition,
-) -> Result<Option<String>> {
+) -> Result<Option<BookClose>> {
     if position.status != PositionStatus::Open || !position.is_hedged() {
         return Ok(None);
     }
@@ -3516,12 +3529,15 @@ pub async fn book_close_ready(
     .await?;
     let quote = exit_quote(position, &long_book, &short_book).map_err(anyhow::Error::msg)?;
     if quote.net_usdt > Decimal::ZERO {
-        Ok(Some(format!(
-            "按 45 秒盘口核对，现在平仓价差 {}%，整笔预估净赚 {} USDT（{}%，含手续费）",
-            quote.exit_basis_pct,
-            quote.net_usdt.round_dp(4),
-            quote.net_pct
-        )))
+        Ok(Some(BookClose {
+            reason: format!(
+                "按 45 秒盘口核对，现在平仓价差 {}%，整笔预估净赚 {} USDT（{}%，含手续费）",
+                quote.exit_basis_pct,
+                quote.net_usdt.round_dp(4),
+                quote.net_pct
+            ),
+            quote,
+        }))
     } else {
         Ok(None)
     }
@@ -3990,6 +4006,7 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                close_report: None,
                 planned_long: None,
                 planned_short: None,
                 settled_legs: Vec::new(),
@@ -4243,6 +4260,7 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                close_report: None,
                 planned_long: None,
                 planned_short: None,
                 settled_legs: Vec::new(),
@@ -4891,6 +4909,7 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                close_report: None,
                 planned_long: None,
                 planned_short: None,
                 settled_legs: Vec::new(),
@@ -6157,6 +6176,7 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                close_report: None,
                 planned_long: None,
                 planned_short: None,
                 settled_legs: Vec::new(),
@@ -6518,6 +6538,7 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                close_report: None,
                 planned_long: None,
                 planned_short: None,
                 settled_legs: Vec::new(),
@@ -7042,6 +7063,7 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                close_report: None,
                 planned_long: Some(Venue::LighterRh),
                 planned_short: Some(Venue::Arcus),
                 settled_legs: Vec::new(),
