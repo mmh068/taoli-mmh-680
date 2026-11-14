@@ -20,7 +20,7 @@ use serde::Serialize;
 /// 配对榜最多返回多少行。两家大所同时上市的合约可能有几百个，全量下发没有意义。
 pub const MAX_PAIR_ROWS: usize = 300;
 /// 持仓页展示最近多少笔已结束的仓位。
-pub const MAX_CLOSED_POSITIONS: usize = 20;
+pub const MAX_CLOSED_POSITIONS: usize = 30;
 /// 开仓计划允许的单腿名义上限。
 pub const MAX_PLAN_SIZE_USDT: u32 = 1_000_000;
 
@@ -1146,6 +1146,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
         };
         let mut replayed = Replayed::default();
         replayed

@@ -332,6 +332,7 @@ impl Executor {
             planned_short: Some(plan.short.venue),
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: setup.origin.clone(),
         };
         self.persist(&position).await?;
@@ -623,6 +624,7 @@ impl Executor {
         {
             position.set_booked_funding(legs);
         }
+        position.booked_spreads = position.book_missing_spreads();
         position.note = Some(realized_note(
             position,
             entry_prices,
@@ -1657,6 +1659,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: None,
         };
         executor.close(&mut position, None).await.unwrap();
@@ -1719,6 +1722,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: None,
         };
 
@@ -1821,6 +1825,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: None,
         };
 
@@ -2022,6 +2027,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: None,
         };
 
@@ -2590,6 +2596,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: None,
         }
     }

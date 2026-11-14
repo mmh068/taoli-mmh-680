@@ -52,6 +52,9 @@ pub fn arcus(markets: &Value, taker: Decimal) -> anyhow::Result<BTreeMap<String,
                         .to_string(),
                 ),
                 outside_rth: m.get("isOutsideRth").and_then(Value::as_bool),
+                period_rate: None,
+                interval_h: None,
+                funding_at: None,
             },
         );
     }
@@ -91,6 +94,9 @@ pub fn lighter(details: &Value) -> anyhow::Result<BTreeMap<String, VenueMarket>>
                     .and_then(arb_core::parse_decimal),
                 category: None,
                 outside_rth: None,
+                period_rate: None,
+                interval_h: None,
+                funding_at: None,
             },
         );
     }
@@ -278,6 +284,9 @@ pub fn hyperliquid(
                 taker_fee: fee,
                 category: None,
                 outside_rth: None,
+                period_rate: None,
+                interval_h: None,
+                funding_at: None,
             },
         );
     }

@@ -734,14 +734,13 @@ pub fn record_auto(
     at: DateTime<Utc>,
     line: &Line,
     settings: &rh_auto::Settings,
-    report: Option<&ScanReport>,
     held_sec: u64,
     mode: Option<Mode>,
 ) {
     let Some(path) = path else {
         return;
     };
-    let Some(row) = auto_row(at, line, settings, report, held_sec, mode) else {
+    let Some(row) = auto_row(at, line, settings, held_sec, mode) else {
         return;
     };
     if row["openable"] != true {
@@ -1236,11 +1235,10 @@ fn auto_row(
     at: DateTime<Utc>,
     line: &Line,
     settings: &rh_auto::Settings,
-    report: Option<&ScanReport>,
     held_sec: u64,
     mode: Option<Mode>,
 ) -> Option<Value> {
-    let candidate = rh_auto::candidate_of_with(line, settings, report)?;
+    let candidate = rh_auto::candidate_of_with(line, settings)?;
     let held_enough = held_sec >= settings.hold_sec;
     let excluded = rh_auto::symbol_excluded(settings, &candidate.base);
     Some(row(

@@ -481,6 +481,13 @@ footer p { margin: 0 0 6px; max-width: 980px; }
 .closed-kicker .pill { white-space: normal; overflow-wrap: anywhere; letter-spacing: 0; text-transform: none; font-size: 11px; }
 .closed-note { margin: 8px 0; color: var(--text-2); font-size: 12.5px; line-height: 1.45; white-space: normal; overflow-wrap: anywhere; }
 .closed-detail-box h4 { margin: 8px 0; font-size: 12px; font-weight: 600; }
+.basis-compare {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: 8px 28px;
+}
+.basis-compare p { margin: 0 0 4px; font-size: 12.5px; line-height: 1.45; }
+.basis-compare p b { margin-right: 6px; }
 .closed-detail-box .legs-grid {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
   min-width: 0;

@@ -11,6 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use arb_core::{Decimal, Venue};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 /// 价差监控支持的场所（各有行情 WebSocket 接入）。
@@ -201,6 +202,35 @@ pub struct VenueMarket {
     pub category: Option<String>,
     /// Arcus 的 `isOutsideRth`（节假日、提前收盘）。
     pub outside_rth: Option<bool>,
+    /// 这家报的当期资金费（小数）。`None` = 这次成功的费率表里没有这个合约。
+    pub period_rate: Option<Decimal>,
+    /// 结算周期（小时）。与 `period_rate` 成对；0 或缺失都不能用来核算。
+    pub interval_h: Option<u32>,
+    /// 这份费率是哪次成功拉取的。超过 15 分钟不再用。
+    pub funding_at: Option<DateTime<Utc>>,
+}
+
+/// 一条腿上已经取到的当期资金费。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct LegFunding {
+    pub period_rate: Decimal,
+    pub interval_h: u32,
+    pub at: DateTime<Utc>,
+}
+
+impl VenueMarket {
+    /// 能用来核算的当期资金费。周期为 0 或三项缺一，视为没有。
+    pub fn funding(&self) -> Option<LegFunding> {
+        let interval_h = self.interval_h?;
+        if interval_h == 0 {
+            return None;
+        }
+        Some(LegFunding {
+            period_rate: self.period_rate?,
+            interval_h,
+            at: self.funding_at?,
+        })
+    }
 }
 
 /// 每家场所：base → 市场。

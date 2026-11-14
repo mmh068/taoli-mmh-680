@@ -136,6 +136,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
         }
     }
 

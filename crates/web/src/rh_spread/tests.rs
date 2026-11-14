@@ -115,6 +115,9 @@ fn market_with(category: &str, arcus_fee: Option<Decimal>) -> PairMarket {
         taker_fee: fee,
         category: None,
         outside_rth: None,
+        period_rate: None,
+        interval_h: None,
+        funding_at: None,
     };
     PairMarket {
         base: "SPY".into(),

@@ -195,6 +195,12 @@ pub struct Line {
     pub best: Option<Best>,
     /// 两家盘口里较旧的那本多久没更新（秒）。
     pub age_sec: Option<u64>,
+    /// a 腿当期资金费。没有，或结算周期不可用，为 `None`。
+    #[serde(default)]
+    pub funding_a: Option<pairs::LegFunding>,
+    /// b 腿当期资金费。
+    #[serde(default)]
+    pub funding_b: Option<pairs::LegFunding>,
     pub note: Option<String>,
 }
 
@@ -316,6 +322,8 @@ pub fn evaluate(
         long_b: None,
         best: None,
         age_sec: None,
+        funding_a: market.a.funding(),
+        funding_b: market.b.funding(),
         note: None,
     };
     let (Some(book_a), Some(book_b)) = (a, b) else {
@@ -407,6 +415,59 @@ impl Line {
             "long_b" => Some((self.b, self.a, self.long_b.as_ref()?)),
             _ => None,
         }
+    }
+}
+
+/// 用现成连接器拉这家的当期资金费。解析口径与扫描器相同，这里不再折周期。
+async fn fetch_funding(
+    client: &reqwest::Client,
+    venue: Venue,
+) -> anyhow::Result<Vec<arb_core::MarketSnapshot>> {
+    arb_venues::build(venue, client.clone())
+        .fetch_all()
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+/// 成功的一份费率整家替换。没出现在这批结果里的合约清掉，避免沿用已经下架的费率。
+fn fill_funding(
+    markets: &mut std::collections::BTreeMap<String, pairs::VenueMarket>,
+    rates: &[arb_core::MarketSnapshot],
+    at: DateTime<Utc>,
+) {
+    for market in markets.values_mut() {
+        market.period_rate = None;
+        market.interval_h = None;
+        market.funding_at = None;
+    }
+    for rate in rates {
+        if rate.interval_h == 0 {
+            continue;
+        }
+        let Some(market) = markets.get_mut(&rate.symbol.base) else {
+            continue;
+        };
+        market.period_rate = Some(rate.period_rate);
+        market.interval_h = Some(rate.interval_h);
+        market.funding_at = Some(at);
+    }
+}
+
+/// 这一家这次没取到费率：能对上的合约沿用上一份，新合约仍为空。
+fn copy_funding(
+    markets: &mut std::collections::BTreeMap<String, pairs::VenueMarket>,
+    previous: Option<&std::collections::BTreeMap<String, pairs::VenueMarket>>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    for (base, market) in markets.iter_mut() {
+        let Some(old) = previous.get(base) else {
+            continue;
+        };
+        market.period_rate = old.period_rate;
+        market.interval_h = old.interval_h;
+        market.funding_at = old.funding_at;
     }
 }
 
@@ -691,7 +752,14 @@ impl Monitor {
         let mut errors = Vec::new();
         for venue in self.venues() {
             match self.catalog_of(client, venue).await {
-                Ok(markets) => {
+                Ok(mut markets) => {
+                    match fetch_funding(client, venue).await {
+                        Ok(rates) => fill_funding(&mut markets, &rates, Utc::now()),
+                        Err(error) => {
+                            warn!(%venue, "价差监控：取资金费失败，沿用上一份：{error:#}");
+                            copy_funding(&mut markets, catalog.get(&venue));
+                        }
+                    }
                     catalog.insert(venue, markets);
                 }
                 Err(error) => {

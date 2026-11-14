@@ -1548,57 +1548,6 @@ fn leg_with_margin(position: &PairPosition, mut leg: crate::LegFill) -> crate::L
 
 const MANUAL_EXTERNAL: &str = "人工外部处理";
 
-fn known_external_reason(note: &str) -> Option<&'static str> {
-    if note.contains("第一腿") && note.contains("结果不明") {
-        return Some("第一腿成交不明，开仓中断，已在交易所手平");
-    }
-    if note.contains("第二腿") && note.contains("结果不明") {
-        return Some("第二腿成交不明，已在交易所手平");
-    }
-    if note.contains("回滚未完全成功") || note.contains("回滚没完成") {
-        return Some("回滚没完成，已在交易所手平");
-    }
-    if note.contains("剩下的腿") {
-        return Some("平仓中断，剩下的腿已在交易所手平");
-    }
-    if note.contains("平仓没走完") || note.contains("平仓未完成") {
-        return Some("平仓没走完，已在交易所手平");
-    }
-    if note.contains("两腿成交没记上") {
-        return Some("两腿成交没记上，已在交易所手平");
-    }
-    if note.contains("第一腿成交没记上") {
-        return Some("第一腿成交没记上，开仓中断，已在交易所手平");
-    }
-    if note.contains("只剩一条腿") {
-        return Some("只剩一条腿，已在交易所手平");
-    }
-    if note.contains("只成一条腿") || note.contains("只记下一条腿") {
-        return Some("只成一条腿，已在交易所手平");
-    }
-    if note.contains("没记下腿") {
-        return Some("开仓中断，成交没记上，已在交易所手平");
-    }
-    if note.contains("持仓已在交易所手平") || note.contains("在交易所外部平仓") {
-        return Some("持仓已在交易所手平");
-    }
-    None
-}
-
-/// 已经写过的短原因。旧的长备注含「核对 / 对账 / 稍后」，不算。
-fn external_reason_kept(note: &str) -> Option<&str> {
-    let rest = note.strip_prefix("人工外部处理：")?;
-    let reason = rest.split(['；', '。']).next()?.trim();
-    if reason.is_empty()
-        || reason.contains("核对")
-        || reason.contains("对账")
-        || reason.contains("稍后")
-    {
-        return None;
-    }
-    Some(reason)
-}
-
 fn filled_open_side_count(replayed: &Replayed, position: &PairPosition) -> usize {
     let prefix = position_order_prefix(&position.id);
     let mut buy = false;
@@ -1623,7 +1572,7 @@ fn filled_open_side_count(replayed: &Replayed, position: &PairPosition) -> usize
 fn manual_external_reason(position: &PairPosition, replayed: &Replayed) -> &'static str {
     let note = position.note.as_deref().unwrap_or("");
     if note.contains("结果不明") || note.contains("回滚") {
-        if let Some(reason) = known_external_reason(note) {
+        if let Some(reason) = crate::types::known_external_reason(note) {
             return reason;
         }
     }
@@ -2511,20 +2460,9 @@ pub async fn settle_closed_from_fills(
             fee_usdt: leg.fees_usdt,
         })
         .collect();
+    settled.booked_spreads = settled.book_missing_spreads();
     settled.note = Some(if position.is_external_close() {
-        let reason = position
-            .note
-            .as_deref()
-            .and_then(external_reason_kept)
-            .map(str::to_string)
-            .or_else(|| {
-                position
-                    .note
-                    .as_deref()
-                    .and_then(known_external_reason)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "持仓已在交易所手平".into());
+        let reason = crate::types::external_close_reason(position.note.as_deref());
         format!("{MANUAL_EXTERNAL}：{reason}；{described}")
     } else {
         format!(
@@ -4011,6 +3949,7 @@ mod tests {
                 planned_short: None,
                 settled_legs: Vec::new(),
                 funding_legs: Vec::new(),
+                booked_spreads: None,
                 origin: None,
             }
         }
@@ -4265,6 +4204,7 @@ mod tests {
                 planned_short: None,
                 settled_legs: Vec::new(),
                 funding_legs: Vec::new(),
+                booked_spreads: None,
                 origin: None,
             }
         }
@@ -4914,6 +4854,7 @@ mod tests {
                 planned_short: None,
                 settled_legs: Vec::new(),
                 funding_legs: Vec::new(),
+                booked_spreads: None,
                 origin: None,
             }
         }
@@ -6181,6 +6122,7 @@ mod tests {
                 planned_short: None,
                 settled_legs: Vec::new(),
                 funding_legs: Vec::new(),
+                booked_spreads: None,
                 origin: None,
             }
         }
@@ -6543,6 +6485,7 @@ mod tests {
                 planned_short: None,
                 settled_legs: Vec::new(),
                 funding_legs: Vec::new(),
+                booked_spreads: None,
                 origin: None,
             }
         }
@@ -7068,6 +7011,7 @@ mod tests {
                 planned_short: Some(Venue::Arcus),
                 settled_legs: Vec::new(),
                 funding_legs: Vec::new(),
+                booked_spreads: None,
                 origin: None,
             }
         }

@@ -2854,18 +2854,55 @@ function closedFundingOnlyCard(funding) {
   </div>`;
 }
 
-function closeReviewHtml(report) {
-  if (!report) return '';
-  const missing = '<span class="muted">没记下</span>';
-  const quote = report.quote;
-  const book = quote
-    ? `多腿卖 ${price(quote.long_price)} · 空腿买回 ${price(quote.short_price)} · 平仓价差 ${pctRaw(quote.exit_basis_pct, 4)} · 预估净额 ${pnlUsd(quote.net_usdt)}`
-    : missing;
-  const row = (label, value) => `<div class="kv"><span>${label}</span><span>${value}</span></div>`;
-  return `<h4>平仓核对</h4>
-    ${row('原因', report.reason ? esc(report.reason) : missing)}
-    ${row('触发时标记价基差', report.mark_basis_pct == null ? missing : pctRaw(report.mark_basis_pct, 4))}
-    ${row('放行盘口', book)}`;
+function pairPrices(legs, priceKey) {
+  if (!Array.isArray(legs)) return null;
+  const buy = legs.filter((leg) => leg && leg.side === 'buy');
+  const sell = legs.filter((leg) => leg && leg.side === 'sell');
+  if (buy.length !== 1 || sell.length !== 1) return null;
+  const longPrice = num(buy[0][priceKey]);
+  const shortPrice = num(sell[0][priceKey]);
+  if (longPrice === null || shortPrice === null || longPrice + shortPrice <= 0) return null;
+  return { longPrice, shortPrice };
+}
+
+function spreadText(name, pct) {
+  return `${name} ${pct === null || pct === undefined ? '没记下' : pctRaw(pct, 4)}`;
+}
+
+function reviewPricesText(kind, prices, spreadPct, spreadName, net) {
+  if (!prices) return '没记下';
+  const longVerb = kind === 'open' ? '多腿买' : '多腿卖';
+  const shortVerb = kind === 'open' ? '空腿卖' : '空腿买回';
+  const netText = net == null ? '' : ` · 预估净额 ${pnlUsd(net)}`;
+  return `${longVerb} ${price(prices.longPrice)} · ${shortVerb} ${price(prices.shortPrice)} · ${spreadText(spreadName, spreadPct)}${netText}`;
+}
+
+function bookedReviewHtml(p) {
+  const line = (label, text) => `<p><b>${label}</b> ${text}</p>`;
+  const spreads = p.booked_spreads;
+  const openLegs = p.open_report ? [p.open_report.first, p.open_report.second] : null;
+  let openFill = pairPrices(p.settled_legs, 'entry_price');
+  if (!openFill) openFill = pairPrices(openLegs, 'actual_price');
+  const quote = p.close_report && p.close_report.quote;
+  const target = p.rules && p.rules.basis_exit_pct != null ? ` · 目标 ≤ ${pctRaw(p.rules.basis_exit_pct, 4)}` : '';
+  const openWhy = `${p.origin === 'manual' ? '手动' : '自动'} · ${spreadText('标记价差', num(p.entry_basis_pct))}${target}`;
+  const closeWhy = p.close_report && p.close_report.reason
+    ? `${spreadText('标记价差', p.close_report.mark_basis_pct != null ? num(p.close_report.mark_basis_pct) : null)} · ${esc(p.close_report.reason)}`
+    : (p.closed_externally ? esc(externalReason(p.note)) : '没记下');
+  return `<div class="basis-compare">
+    <div>
+      <h4>开仓核对</h4>
+      ${line('原因', openWhy)}
+      ${line('预计', reviewPricesText('open', pairPrices(openLegs, 'expected_price'), spreads && num(spreads.open_expected_pct), '盘口价差'))}
+      ${line('实际', reviewPricesText('open', openFill, spreads && num(spreads.open_actual_pct), '成交价差'))}
+    </div>
+    <div>
+      <h4>平仓核对</h4>
+      ${line('原因', closeWhy)}
+      ${line('预计', reviewPricesText('close', quote && { longPrice: num(quote.long_price), shortPrice: num(quote.short_price) }, quote && num(quote.exit_basis_pct), '盘口价差', quote && quote.net_usdt))}
+      ${line('实际', reviewPricesText('close', pairPrices(p.settled_legs, 'exit_price'), spreads && num(spreads.close_actual_pct), '成交价差'))}
+    </div>
+  </div>`;
 }
 
 function closedDetailRow(p) {
@@ -2892,7 +2929,7 @@ function closedDetailRow(p) {
     ${note ? `<p class="closed-note">${esc(note)}</p>` : ''}
     <h4>入账时记下的成交</h4>
     ${body}
-    ${closeReviewHtml(p.close_report)}
+    ${bookedReviewHtml(p)}
   </div></td></tr>`;
 }
 

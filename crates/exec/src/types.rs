@@ -451,6 +451,9 @@ pub struct PairPosition {
     /// 入账时查到的各交易所资金费。没有这一项就不拆到交易所。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_legs: Vec<VenueFunding>,
+    /// 入账时才算出来的价差。价格和原因仍读原字段，不在这里再抄。旧台账没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub booked_spreads: Option<BookedSpreads>,
 }
 
 /// 一条腿在入账那一刻的开平仓。页面只读这个，不再另算。
@@ -482,12 +485,151 @@ pub struct EntryLegs {
     pub short: LegFill,
 }
 
+/// 入账时补上的价差。百分数，(空 − 多) / 两价均值。
+/// 开仓预计、开仓实际、平仓实际这三笔原先没有。平仓预计价差已在 `close_report`，不抄。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BookedSpreads {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_expected_pct: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_actual_pct: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_actual_pct: Option<Decimal>,
+}
+
+/// 已经写过的短原因。旧的长备注含「核对 / 对账 / 稍后」，不算。
+pub(crate) fn external_reason_kept(note: &str) -> Option<&str> {
+    let rest = note.strip_prefix("人工外部处理：")?;
+    let reason = rest.split(['；', '。']).next()?.trim();
+    if reason.is_empty()
+        || reason.contains("核对")
+        || reason.contains("对账")
+        || reason.contains("稍后")
+    {
+        return None;
+    }
+    Some(reason)
+}
+
+/// 从中断备注里认出的外部平仓原因。认不出就没有。
+pub(crate) fn known_external_reason(note: &str) -> Option<&'static str> {
+    if note.contains("第一腿") && note.contains("结果不明") {
+        return Some("第一腿成交不明，开仓中断，已在交易所手平");
+    }
+    if note.contains("第二腿") && note.contains("结果不明") {
+        return Some("第二腿成交不明，已在交易所手平");
+    }
+    if note.contains("回滚未完全成功") || note.contains("回滚没完成") {
+        return Some("回滚没完成，已在交易所手平");
+    }
+    if note.contains("剩下的腿") {
+        return Some("平仓中断，剩下的腿已在交易所手平");
+    }
+    if note.contains("平仓没走完") || note.contains("平仓未完成") {
+        return Some("平仓没走完，已在交易所手平");
+    }
+    if note.contains("两腿成交没记上") {
+        return Some("两腿成交没记上，已在交易所手平");
+    }
+    if note.contains("第一腿成交没记上") {
+        return Some("第一腿成交没记上，开仓中断，已在交易所手平");
+    }
+    if note.contains("只剩一条腿") {
+        return Some("只剩一条腿，已在交易所手平");
+    }
+    if note.contains("只成一条腿") || note.contains("只记下一条腿") {
+        return Some("只成一条腿，已在交易所手平");
+    }
+    if note.contains("没记下腿") {
+        return Some("开仓中断，成交没记上，已在交易所手平");
+    }
+    if note.contains("持仓已在交易所手平") || note.contains("在交易所外部平仓") {
+        return Some("持仓已在交易所手平");
+    }
+    None
+}
+
+/// 入账备注里要用的外部平仓短原因。认不出时用同一句兜底，不留空。
+pub(crate) fn external_close_reason(note: Option<&str>) -> String {
+    note.and_then(external_reason_kept)
+        .map(str::to_string)
+        .or_else(|| note.and_then(known_external_reason).map(str::to_string))
+        .unwrap_or_else(|| "持仓已在交易所手平".into())
+}
+
+fn mean_spread_pct(long: Decimal, short: Decimal) -> Option<Decimal> {
+    let mid = (long + short) / Decimal::TWO;
+    (mid > Decimal::ZERO).then(|| (short - long) / mid * Decimal::ONE_HUNDRED)
+}
+
+fn pair_side_prices(items: impl IntoIterator<Item = (Side, Decimal)>) -> Option<(Decimal, Decimal)> {
+    let mut long = None;
+    let mut short = None;
+    for (side, price) in items {
+        match side {
+            Side::Buy => {
+                if long.replace(price).is_some() {
+                    return None;
+                }
+            }
+            Side::Sell => {
+                if short.replace(price).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    let (long, short) = (long?, short?);
+    (long + short > Decimal::ZERO).then_some((long, short))
+}
+
+fn spread_of(items: impl IntoIterator<Item = (Side, Decimal)>) -> Option<Decimal> {
+    let (long, short) = pair_side_prices(items)?;
+    mean_spread_pct(long, short)
+}
+
 impl PairPosition {
     /// 把入账时查到的各交易所资金费记下。合计仍写在 `realized_funding_usdt`。
     pub fn set_booked_funding(&mut self, legs: Vec<VenueFunding>) {
         let total = legs.iter().map(|leg| leg.usdt).sum();
         self.realized_funding_usdt = Some(total);
         self.funding_legs = legs;
+    }
+
+    /// 盈亏入账时只补仓位上还没有的价差。三笔都算不出就不写。
+    pub fn book_missing_spreads(&self) -> Option<BookedSpreads> {
+        let open_report = self.open_report.as_ref();
+        let open_actual = spread_of(
+            self.settled_legs
+                .iter()
+                .map(|leg| (leg.side, leg.entry_price)),
+        )
+        .or_else(|| {
+            open_report.and_then(|report| {
+                spread_of([
+                    (report.first.side, report.first.actual_price),
+                    (report.second.side, report.second.actual_price),
+                ])
+            })
+        });
+        let spreads = BookedSpreads {
+            open_expected_pct: open_report.and_then(|report| {
+                spread_of([
+                    (report.first.side, report.first.expected_price),
+                    (report.second.side, report.second.expected_price),
+                ])
+            }),
+            open_actual_pct: open_actual,
+            close_actual_pct: spread_of(
+                self.settled_legs
+                    .iter()
+                    .map(|leg| (leg.side, leg.exit_price)),
+            ),
+        };
+        (spreads.open_expected_pct.is_some()
+            || spreads.open_actual_pct.is_some()
+            || spreads.close_actual_pct.is_some())
+        .then_some(spreads)
     }
 
     /// 把已经计入已实现盈亏的一笔退出成交并进分腿记录，返回这一笔的价格盈亏。
@@ -708,6 +850,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: None,
         };
         assert!(position.is_naked(), "两腿都没成交也是裸敞口");
@@ -771,6 +914,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: None,
         };
         // 基差收敛到 0 → 赚 1%
@@ -815,6 +959,7 @@ mod tests {
             planned_short: None,
             settled_legs: Vec::new(),
             funding_legs: Vec::new(),
+            booked_spreads: None,
             origin: None,
         };
         let leg = LegFill {
@@ -856,5 +1001,85 @@ mod tests {
             2,
             "尾巴消掉后是干净的 751.99"
         );
+    }
+
+    #[test]
+    fn booked_spreads_only_store_the_missing_mean_spreads() {
+        let position = PairPosition {
+            margin_mode: crate::MarginMode::Isolated,
+            id: "p1".into(),
+            symbol: Symbol::perp("NVDA", "USDT"),
+            strategy: Strategy::Spread,
+            long: None,
+            short: None,
+            entry_basis_pct: dec!(0.088),
+            expected_round_trip_cost: Decimal::ZERO,
+            status: PositionStatus::Closed,
+            opened_at: Utc::now(),
+            closed_at: None,
+            note: None,
+            leverage: None,
+            rules: TaskRules {
+                basis_exit_pct: Some(dec!(0.04)),
+                ..TaskRules::default()
+            },
+            trims: 0,
+            exits: 1,
+            margin_added_usdt: Decimal::ZERO,
+            realized_pnl_usdt: Decimal::ZERO,
+            realized_fee_usdt: Decimal::ZERO,
+            realized_source: Some(RealizedSource::Executor),
+            realized_funding_usdt: None,
+            funding_checked_at: None,
+            closed_externally: false,
+            entry_legs: None,
+            pnl_unattributed: None,
+            open_report: None,
+            close_report: Some(crate::report::CloseReport {
+                reason: Some("标记价基差已收敛".into()),
+                mark_basis_pct: Some(dec!(-0.0814)),
+                quote: Some(crate::report::CloseQuote {
+                    long_price: dec!(159.47),
+                    short_price: dec!(159.61),
+                    exit_basis_pct: dec!(0.04),
+                    net_usdt: dec!(0.0015),
+                }),
+            }),
+            planned_long: None,
+            planned_short: None,
+            settled_legs: vec![
+                SettledLeg {
+                    venue: Venue::Binance,
+                    side: Side::Buy,
+                    quantity: dec!(1),
+                    entry_price: dec!(100),
+                    exit_price: dec!(159.45),
+                    price_pnl_usdt: Decimal::ZERO,
+                    fee_usdt: Decimal::ZERO,
+                },
+                SettledLeg {
+                    venue: Venue::Lighter,
+                    side: Side::Sell,
+                    quantity: dec!(1),
+                    entry_price: dec!(100.2),
+                    exit_price: dec!(159.61),
+                    price_pnl_usdt: Decimal::ZERO,
+                    fee_usdt: Decimal::ZERO,
+                },
+            ],
+            funding_legs: Vec::new(),
+            booked_spreads: None,
+            origin: Some("manual".into()),
+        };
+        let spreads = position.book_missing_spreads().expect("有成交价差");
+        assert!(spreads.open_expected_pct.is_none());
+        assert_eq!(spreads.open_actual_pct.unwrap().round_dp(4), dec!(0.1998));
+        assert_eq!(
+            spreads.close_actual_pct.unwrap().round_dp(4),
+            mean_spread_pct(dec!(159.45), dec!(159.61))
+                .unwrap()
+                .round_dp(4)
+        );
+        assert_ne!(spreads.close_actual_pct.unwrap().round_dp(4), dec!(0.04));
     }
 }

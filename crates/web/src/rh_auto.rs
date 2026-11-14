@@ -300,13 +300,12 @@ pub fn track_holds(
     since: &mut HashMap<HoldKey, Instant>,
     now: Instant,
 ) {
-    track_holds_with(view, settings, None, since, now);
+    track_holds_with(view, settings, since, now);
 }
 
 pub fn track_holds_with(
     view: &View,
     settings: &Settings,
-    report: Option<&arb_scanner::ScanReport>,
     since: &mut HashMap<HoldKey, Instant>,
     now: Instant,
 ) {
@@ -314,7 +313,7 @@ pub fn track_holds_with(
         .lines
         .iter()
         .filter_map(|line| {
-            let candidate = candidate_of_with(line, settings, report)?;
+            let candidate = candidate_of_with(line, settings)?;
             if symbol_excluded(settings, &candidate.base) {
                 return None;
             }
@@ -337,13 +336,12 @@ pub fn pick(
     held_sec: &dyn Fn(&Candidate) -> u64,
     busy_symbols: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Candidate, String> {
-    pick_with(view, settings, None, now, tradable, held_sec, busy_symbols)
+    pick_with(view, settings, now, tradable, held_sec, busy_symbols)
 }
 
 pub fn pick_with(
     view: &View,
     settings: &Settings,
-    report: Option<&arb_scanner::ScanReport>,
     now: DateTime<Utc>,
     tradable: &dyn Fn(Venue) -> bool,
     held_sec: &dyn Fn(&Candidate) -> u64,
@@ -356,7 +354,7 @@ pub fn pick_with(
     let mut waiting: Option<String> = None;
     let mut blocked: Option<String> = None;
     for line in &view.lines {
-        let Some(mut candidate) = candidate_of_with(line, settings, report) else {
+        let Some(mut candidate) = candidate_of_with(line, settings) else {
             continue;
         };
         // 行情断了的那家，盘口会被清空、这一行不会有报价；这里再挡一次「行情连着但账户没连」的。
@@ -389,17 +387,13 @@ pub fn pick_with(
         .unwrap_or_else(|| "没有达到门槛的信号".into()))
 }
 
-/// 一行能不能做、怎么做。没有扫描快照时不算资金费，只给不碰行情的测试用。
+/// 一行能不能做、怎么做。资金费读这一行上已经挂好的当期费率，不读扫描快照。
 pub fn candidate_of(line: &Line, settings: &Settings) -> Option<Candidate> {
-    candidate_of_with(line, settings, None)
+    candidate_of_with(line, settings)
 }
 
-/// 带扫描快照的筛选。开启资金费核算时，没有快照或对不上费率就不合格。
-pub fn candidate_of_with(
-    line: &Line,
-    settings: &Settings,
-    report: Option<&arb_scanner::ScanReport>,
-) -> Option<Candidate> {
+/// 开启资金费核算时，缺费率、费率过期，或净利润加资金费不高于门槛，都不合格。
+pub fn candidate_of_with(line: &Line, settings: &Settings) -> Option<Candidate> {
     let best = line.best.as_ref()?;
     if line.note.is_some() || line.normal_blocked {
         return None;
@@ -415,9 +409,9 @@ pub fn candidate_of_with(
         return None;
     }
     // 回到正常净利润不含资金费，上面已经和面板门槛比过。
-    // 开启核算时再加面板选定小时数的资金费，收为正、付为负。不高于配置值不合格。费率对不上不猜。
+    // 开启核算时再加面板选定小时数的资金费，收为正、付为负。不高于配置值不合格。
     if let Some(hours) = settings.funding_check_hours {
-        let carry = funding_carry_pct(report?, &line.base, long, short, hours)?;
+        let carry = funding_carry_pct(line, long, short, hours, Utc::now()).ok()?;
         if !crate::opportunity_log::net_plus_funding_clears(net, carry) {
             return None;
         }
@@ -438,8 +432,146 @@ pub fn candidate_of_with(
     })
 }
 
-/// 开仓后指定小时的资金费（%）。空腿收、多腿付；任一边对不上当前费率就返回空。
+/// 价差监控行上的资金费，超过这么久没更新就不用。
+const FUNDING_MAX_AGE: chrono::Duration = chrono::Duration::minutes(15);
+
+/// 开仓后指定小时的资金费（%）。空腿收、多腿付。缺腿或过期时返回原因，不猜。
 fn funding_carry_pct(
+    line: &Line,
+    long: Venue,
+    short: Venue,
+    hours: u32,
+    now: DateTime<Utc>,
+) -> Result<Decimal, String> {
+    let long_rate = usable_funding(line, long, now)?;
+    let short_rate = usable_funding(line, short, now)?;
+    let long_cost =
+        long_rate.period_rate * Decimal::from(hours) / Decimal::from(long_rate.interval_h);
+    let short_cost =
+        short_rate.period_rate * Decimal::from(hours) / Decimal::from(short_rate.interval_h);
+    Ok(((short_cost - long_cost) * Decimal::ONE_HUNDRED).round_dp(5))
+}
+
+fn usable_funding<'a>(
+    line: &'a Line,
+    venue: Venue,
+    now: DateTime<Utc>,
+) -> Result<&'a crate::rh_spread::pairs::LegFunding, String> {
+    let rate = if venue == line.a {
+        line.funding_a.as_ref()
+    } else if venue == line.b {
+        line.funding_b.as_ref()
+    } else {
+        None
+    };
+    let Some(rate) = rate else {
+        return Err(format!(
+            "{venue} 没有 {} 的当期资金费，这次不开仓",
+            line.base
+        ));
+    };
+    if rate.interval_h == 0 {
+        return Err(format!(
+            "{venue} 没有 {} 的当期资金费，这次不开仓",
+            line.base
+        ));
+    }
+    if now.signed_duration_since(rate.at) > FUNDING_MAX_AGE {
+        return Err(format!("{venue} 的资金费超过 15 分钟没更新，这次不开仓"));
+    }
+    Ok(rate)
+}
+
+/// 价差已经合格，但资金费核算挡住了开仓。不含价差本身不合格的行。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FundingBlock {
+    pub base: String,
+    pub long: Venue,
+    pub short: Venue,
+    pub reason: String,
+}
+
+/// 这一行若只差资金费就能进候选，返回挡住它的原因。核算关闭、价差不合格时为 `None`。
+pub fn funding_block(line: &Line, settings: &Settings) -> Option<FundingBlock> {
+    let hours = settings.funding_check_hours?;
+    let best = line.best.as_ref()?;
+    if line.note.is_some() || line.normal_blocked {
+        return None;
+    }
+    line.normal.as_ref()?;
+    let (long, short, leg) = line.legs(best.direction)?;
+    let net = leg.net_to_normal_pct?;
+    if net < settings.min_net_pct
+        || leg.quote.entry_pct <= Decimal::ZERO
+        || leg.net_to_zero_pct <= Decimal::ZERO
+    {
+        return None;
+    }
+    let Err(reason) = ensure_funding_allows(line, long, short, hours, net) else {
+        return None;
+    };
+    Some(FundingBlock {
+        base: line.base.clone(),
+        long,
+        short,
+        reason,
+    })
+}
+
+/// 资金费核算开着时才用。回到正常净利润不含资金费，再加上这段时间的资金费。
+/// 和不高于配置值就不做。缺一腿或超过 15 分钟没更新时不猜。
+pub fn ensure_funding_allows(
+    line: &Line,
+    long: Venue,
+    short: Venue,
+    hours: u32,
+    profit_pct: Decimal,
+) -> Result<(), String> {
+    let carry = funding_carry_pct(line, long, short, hours, Utc::now())?;
+    if !crate::opportunity_log::net_plus_funding_clears(profit_pct, carry) {
+        let sum = (profit_pct + carry).round_dp(4);
+        let floor = crate::opportunity_log::net_plus_funding_min_pct();
+        return Err(format!(
+            "开仓后 {hours} 小时：回到正常净利润 {}% + 资金费 {}% = {}%，不高于门槛 {}%，这次不开仓",
+            profit_pct.normalize(),
+            carry.normalize(),
+            sum.normalize(),
+            floor.normalize()
+        ));
+    }
+    Ok(())
+}
+
+/// 手动开仓仍用扫描快照的 8 小时资金费，和预检同一条比较。自动开仓不走这里。
+pub fn ensure_snapshot_funding_allows(
+    report: Option<&arb_scanner::ScanReport>,
+    base: &str,
+    long: Venue,
+    short: Venue,
+    hours: u32,
+    profit_pct: Decimal,
+) -> Result<(), String> {
+    let Some(report) = report else {
+        return Err("没有扫描快照，对不上资金费，这次不开仓".into());
+    };
+    let Some(carry) = snapshot_funding_carry_pct(report, base, long, short, hours) else {
+        return Err("两条腿的资金费对不上当前快照，这次不开仓".into());
+    };
+    if !crate::opportunity_log::net_plus_funding_clears(profit_pct, carry) {
+        let sum = (profit_pct + carry).round_dp(4);
+        let floor = crate::opportunity_log::net_plus_funding_min_pct();
+        return Err(format!(
+            "开仓后 {hours} 小时：回到正常净利润 {}% + 资金费 {}% = {}%，不高于门槛 {}%，这次不开仓",
+            profit_pct.normalize(),
+            carry.normalize(),
+            sum.normalize(),
+            floor.normalize()
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_funding_carry_pct(
     report: &arb_scanner::ScanReport,
     base: &str,
     long: Venue,
@@ -456,76 +588,6 @@ fn funding_carry_pct(
     let short_cost =
         short_rate.period_rate * Decimal::from(hours) / Decimal::from(short_rate.interval_h);
     Some(((short_cost - long_cost) * Decimal::ONE_HUNDRED).round_dp(5))
-}
-
-/// 价差已经合格，但资金费核算挡住了开仓。不含价差本身不合格的行。
-#[derive(Debug, Clone, PartialEq)]
-pub struct FundingBlock {
-    pub base: String,
-    pub long: Venue,
-    pub short: Venue,
-    pub reason: String,
-}
-
-/// 这一行若只差资金费就能进候选，返回挡住它的原因。核算关闭、价差不合格时为 `None`。
-pub fn funding_block(
-    line: &Line,
-    settings: &Settings,
-    report: Option<&arb_scanner::ScanReport>,
-) -> Option<FundingBlock> {
-    let hours = settings.funding_check_hours?;
-    let best = line.best.as_ref()?;
-    if line.note.is_some() || line.normal_blocked {
-        return None;
-    }
-    line.normal.as_ref()?;
-    let (long, short, leg) = line.legs(best.direction)?;
-    let net = leg.net_to_normal_pct?;
-    if net < settings.min_net_pct
-        || leg.quote.entry_pct <= Decimal::ZERO
-        || leg.net_to_zero_pct <= Decimal::ZERO
-    {
-        return None;
-    }
-    let Err(reason) = ensure_funding_allows(report, &line.base, long, short, hours, net) else {
-        return None;
-    };
-    Some(FundingBlock {
-        base: line.base.clone(),
-        long,
-        short,
-        reason,
-    })
-}
-
-/// 资金费核算开着时才用。回到正常净利润不含资金费，再加上这段时间的资金费。
-/// 和不高于配置值就不做。没有快照或两条腿对不上当前费率时不猜。
-pub fn ensure_funding_allows(
-    report: Option<&arb_scanner::ScanReport>,
-    base: &str,
-    long: Venue,
-    short: Venue,
-    hours: u32,
-    profit_pct: Decimal,
-) -> Result<(), String> {
-    let Some(report) = report else {
-        return Err("没有扫描快照，对不上资金费，这次不开仓".into());
-    };
-    let Some(carry) = funding_carry_pct(report, base, long, short, hours) else {
-        return Err("两条腿的资金费对不上当前快照，这次不开仓".into());
-    };
-    if !crate::opportunity_log::net_plus_funding_clears(profit_pct, carry) {
-        let sum = (profit_pct + carry).round_dp(4);
-        let floor = crate::opportunity_log::net_plus_funding_min_pct();
-        return Err(format!(
-            "开仓后 {hours} 小时：回到正常净利润 {}% + 资金费 {}% = {}%，不高于门槛 {}%，这次不开仓",
-            profit_pct.normalize(),
-            carry.normalize(),
-            sum.normalize(),
-            floor.normalize()
-        ));
-    }
-    Ok(())
 }
 
 fn current_rate<'a>(
@@ -563,7 +625,6 @@ fn record_monitor_signals(view: &View) {
 fn record_auto_lines(
     view: &View,
     settings: &Settings,
-    report: Option<&arb_scanner::ScanReport>,
     since: &HashMap<HoldKey, Instant>,
     mode: Mode,
 ) {
@@ -574,21 +635,13 @@ fn record_auto_lines(
     let now = Instant::now();
     let at = Utc::now();
     for line in &view.lines {
-        let Some(candidate) = candidate_of_with(line, settings, report) else {
+        let Some(candidate) = candidate_of_with(line, settings) else {
             continue;
         };
         let held = since.get(&candidate.hold_key()).map_or(0, |started| {
             now.saturating_duration_since(*started).as_secs()
         });
-        crate::opportunity_log::record_auto(
-            Some(path),
-            at,
-            line,
-            settings,
-            report,
-            held,
-            Some(mode),
-        );
+        crate::opportunity_log::record_auto(Some(path), at, line, settings, held, Some(mode));
     }
 }
 
@@ -928,36 +981,18 @@ impl AutoTrader {
             inner.persisted.settings.clone()
         };
         let view = state.rh_spread.view().await;
-        let report = state
-            .cache
-            .get()
-            .await
-            .map(|snapshot| snapshot.report.clone());
         let now = Utc::now();
         // 先记符合开仓条件的币，再决定这一轮下不下单。暂停、只读、没连上也不漏记。
         let held_for_log = {
             let mut inner = self.inner.lock().await;
-            track_holds_with(
-                &view,
-                &settings,
-                report.as_ref(),
-                &mut inner.since,
-                Instant::now(),
-            );
+            track_holds_with(&view, &settings, &mut inner.since, Instant::now());
             inner.since.clone()
         };
         let log_view = view.clone();
         let log_settings = settings.clone();
-        let log_report = report.clone();
         let mode = settings.mode;
         tokio::spawn(async move {
-            record_auto_lines(
-                &log_view,
-                &log_settings,
-                log_report.as_ref(),
-                &held_for_log,
-                mode,
-            );
+            record_auto_lines(&log_view, &log_settings, &held_for_log, mode);
         });
         if self
             .inner
@@ -1001,7 +1036,7 @@ impl AutoTrader {
                     })
                 );
                 drop(inner);
-                alert_funding_blocks(state, &view, &settings, report.as_ref());
+                alert_funding_blocks(state, &view, &settings);
                 return;
             }
         }
@@ -1029,13 +1064,7 @@ impl AutoTrader {
                 .filter(|o| o.mode == mode && exposed.iter().any(|(id, _)| id == &o.id))
                 .count();
             // 计时每秒都更新（哪怕这一刻因为限额不下单），免得限额解除时拿旧的起点当「已保持很久」。
-            track_holds_with(
-                &view,
-                &settings,
-                report.as_ref(),
-                &mut inner.since,
-                Instant::now(),
-            );
+            track_holds_with(&view, &settings, &mut inner.since, Instant::now());
             if open_auto >= settings.max_positions {
                 inner.status = format!(
                     "自动仓位已到上限（{open_auto}/{}），等平仓",
@@ -1055,7 +1084,7 @@ impl AutoTrader {
                 return;
             }
             let instant = Instant::now();
-            track_holds_with(&view, &settings, report.as_ref(), &mut inner.since, instant);
+            track_holds_with(&view, &settings, &mut inner.since, instant);
             let since = inner.since.clone();
             let held = |c: &Candidate| {
                 since
@@ -1086,15 +1115,7 @@ impl AutoTrader {
                 Some(venues) => venues.contains(&venue),
                 None => false,
             };
-            match pick_with(
-                &view,
-                &settings,
-                report.as_ref(),
-                now,
-                &tradable,
-                &held,
-                &busy,
-            ) {
+            match pick_with(&view, &settings, now, &tradable, &held, &busy) {
                 Ok(candidate) => {
                     inner.attempting = Some(candidate.base.clone());
                     inner.status = format!("正在为 {} 下单…", candidate.base);
@@ -1104,7 +1125,7 @@ impl AutoTrader {
                 Err(why) => {
                     inner.status = format!("监控中：{why}");
                     drop(inner);
-                    alert_funding_blocks(state, &view, &settings, report.as_ref());
+                    alert_funding_blocks(state, &view, &settings);
                     return;
                 }
             }
@@ -1354,18 +1375,13 @@ impl AutoTrader {
 }
 
 /// 价差已合格、只被资金费挡住的行，按合约和两条交易所推一条。同一组 30 分钟内不重复。
-fn alert_funding_blocks(
-    state: &AppState,
-    view: &View,
-    settings: &Settings,
-    report: Option<&arb_scanner::ScanReport>,
-) {
+fn alert_funding_blocks(state: &AppState, view: &View, settings: &Settings) {
     if settings.funding_check_hours.is_none() {
         return;
     }
     let mut seen = std::collections::BTreeSet::new();
     for line in &view.lines {
-        let Some(block) = funding_block(line, settings, report) else {
+        let Some(block) = funding_block(line, settings) else {
             continue;
         };
         if !seen.insert((block.base.clone(), block.long, block.short)) {
@@ -1565,8 +1581,36 @@ mod tests {
                 net_usdt: None,
             }),
             age_sec: Some(0),
+            funding_a: None,
+            funding_b: None,
             note: None,
         }
+    }
+
+    fn with_funding(
+        mut row: Line,
+        long_rate: Decimal,
+        long_hours: u32,
+        short_rate: Decimal,
+        short_hours: u32,
+    ) -> Line {
+        let at = Utc::now();
+        let quote = |period_rate, interval_h| {
+            Some(crate::rh_spread::pairs::LegFunding {
+                period_rate,
+                interval_h,
+                at,
+            })
+        };
+        // long_a：a 是多腿。long_b：b 是多腿。
+        if row.best.as_ref().is_some_and(|best| best.direction == "long_b") {
+            row.funding_b = quote(long_rate, long_hours);
+            row.funding_a = quote(short_rate, short_hours);
+        } else {
+            row.funding_a = quote(long_rate, long_hours);
+            row.funding_b = quote(short_rate, short_hours);
+        }
+        row
     }
 
     fn view(lines: Vec<Line>) -> View {
@@ -1655,123 +1699,69 @@ mod tests {
 
     #[test]
     fn an_eight_hour_funding_cost_that_covers_the_profit_is_not_a_candidate() {
-        let row = line("NVDA", "long_a", leg("0.30", "0.20", "0.09"), -0.11);
+        let bare = line("NVDA", "long_a", leg("0.30", "0.20", "0.09"), -0.11);
         // long_a：多 Arcus、空 Lighter RH。多腿每小时付 0.01%，空腿不收：8 小时付 0.08%。
         // 回到正常净利润 0.09% 不含资金费。0.09% + (-0.08%) 仍高于 0。
-        let report = funding_report(
-            "NVDA",
-            Venue::Arcus,
-            dec("0.0001"),
-            1,
-            Venue::LighterRh,
-            Decimal::ZERO,
-            1,
-        );
-        let funding = funding_carry_pct(&report, "NVDA", Venue::Arcus, Venue::LighterRh, 8);
+        let row = with_funding(bare.clone(), dec("0.0001"), 1, Decimal::ZERO, 1);
+        let funding = funding_carry_pct(&row, Venue::Arcus, Venue::LighterRh, 8, Utc::now());
         let mut checking = settings();
         checking.funding_check_hours = Some(8);
         assert!(
-            candidate_of_with(&row, &checking, Some(&report)).is_some(),
+            candidate_of_with(&row, &checking).is_some(),
             "8 小时付 0.08%，净利润 0.09% 加资金费后仍高于 0，funding={funding:?}"
         );
-        let costly = funding_report(
-            "NVDA",
-            Venue::Arcus,
-            dec("0.0002"),
-            1,
-            Venue::LighterRh,
-            Decimal::ZERO,
-            1,
-        );
+        let costly = with_funding(bare.clone(), dec("0.0002"), 1, Decimal::ZERO, 1);
         assert!(
-            candidate_of_with(&row, &checking, Some(&costly)).is_none(),
+            candidate_of_with(&costly, &checking).is_none(),
             "8 小时付 0.16%，净利润 0.09% 加资金费后不高于 0"
         );
         let mut one_hour = checking.clone();
         one_hour.funding_check_hours = Some(1);
         assert!(
-            candidate_of_with(&row, &one_hour, Some(&costly)).is_some(),
+            candidate_of_with(&costly, &one_hour).is_some(),
             "同一费率按面板的 1 小时只付 0.02%，净利润加资金费后仍高于 0"
         );
         assert!(
-            candidate_of_with(&row, &settings(), Some(&report)).is_some(),
+            candidate_of_with(&row, &settings()).is_some(),
             "默认关闭资金费核算"
         );
-        let cheaper = funding_report(
-            "NVDA",
-            Venue::Arcus,
-            Decimal::ZERO,
-            1,
-            Venue::LighterRh,
-            Decimal::ZERO,
-            1,
+        let cheaper = with_funding(bare.clone(), Decimal::ZERO, 1, Decimal::ZERO, 1);
+        assert!(candidate_of_with(&cheaper, &checking).is_some());
+        assert!(
+            candidate_of_with(&bare, &checking).is_none(),
+            "行上没有资金费，不能当成对得上"
         );
-        assert!(candidate_of_with(&row, &checking, Some(&cheaper)).is_some());
-        assert!(candidate_of_with(&row, &checking, None).is_none());
-        let block = funding_block(&row, &checking, Some(&costly)).expect("资金费挡住的要能告警");
+        let block = funding_block(&costly, &checking).expect("资金费挡住的要能告警");
         assert_eq!(block.base, "NVDA");
         assert_eq!((block.long, block.short), (Venue::Arcus, Venue::LighterRh));
         assert!(block.reason.contains("不高于门槛"), "{}", block.reason);
-        assert!(funding_block(&row, &checking, Some(&report)).is_none());
-        assert!(funding_block(&row, &settings(), Some(&costly)).is_none());
-        let mut stale = row.clone();
-        stale.note = Some("盘口过期".into());
-        assert!(funding_block(&stale, &checking, Some(&costly)).is_none());
-    }
+        assert!(funding_block(&row, &checking).is_none());
+        assert!(funding_block(&costly, &settings()).is_none());
+        let mut stale_book = costly.clone();
+        stale_book.note = Some("盘口过期".into());
+        assert!(funding_block(&stale_book, &checking).is_none());
 
-    fn funding_report(
-        base: &str,
-        long: Venue,
-        long_rate: Decimal,
-        long_hours: u32,
-        short: Venue,
-        short_rate: Decimal,
-        short_hours: u32,
-    ) -> arb_scanner::ScanReport {
-        let rate = |venue: Venue, period: Decimal, hours: u32| arb_core::MarketSnapshot {
-            venue,
-            symbol: arb_core::Symbol::perp(base, "USDT"),
-            period_rate: period,
-            interval_h: hours,
-            interval_assumed: false,
-            next_funding_at: Utc::now(),
-            next_funding_estimated: false,
-            taker_fee: Some(dec("0.0001")),
-            mark_price: Some(Decimal::ONE),
-            index_price: Some(Decimal::ONE),
-            best_bid: None,
-            best_ask: None,
-            bid_size_usdt: None,
-            ask_size_usdt: None,
-            open_interest_usdt: None,
-            quote_volume_24h: None,
-            max_leverage: None,
-            maintenance_margin: None,
-            oi_capped: false,
-        };
-        arb_scanner::ScanReport {
-            generated_at: Utc::now(),
-            fee_per_side: dec("0.0005"),
-            amortize_days: Decimal::ONE,
-            spread_hold_days: Decimal::ONE,
-            max_entry_basis_pct: None,
-            min_venues: 2,
-            venues: Vec::new(),
-            symbols: vec![arb_scanner::SymbolView {
-                symbol: arb_core::Symbol::perp(base, "USDT"),
-                rates: vec![
-                    rate(long, long_rate, long_hours),
-                    rate(short, short_rate, short_hours),
-                ],
-                funding: Vec::new(),
-                spread: Vec::new(),
-            }],
-            unverified: Vec::new(),
-            suspicious: Vec::new(),
-            gated: Vec::new(),
-            unpaired: Vec::new(),
-            totals: arb_scanner::Totals::default(),
-        }
+        let mut missing = row.clone();
+        missing.funding_b = None;
+        let missing_block = funding_block(&missing, &checking).expect("缺一腿要说明是哪家");
+        assert!(
+            missing_block.reason.contains("lighter-rh 没有 NVDA 的当期资金费"),
+            "{}",
+            missing_block.reason
+        );
+        let mut old = row.clone();
+        old.funding_a.as_mut().unwrap().at = Utc::now() - chrono::Duration::minutes(16);
+        let old_block = funding_block(&old, &checking).expect("过期费率不能拿来核算");
+        assert!(
+            old_block.reason.contains("arcus 的资金费超过 15 分钟没更新"),
+            "{}",
+            old_block.reason
+        );
+        // 周期不同仍折到面板小时数：1 小时 0.01% 与 8 小时 0.08%，按 1 小时算资金费为 0。
+        let mixed = with_funding(bare, dec("0.0001"), 1, dec("0.0008"), 8);
+        let mixed_carry =
+            funding_carry_pct(&mixed, Venue::Arcus, Venue::LighterRh, 1, Utc::now()).unwrap();
+        assert_eq!(mixed_carry, Decimal::ZERO);
     }
 
     #[test]

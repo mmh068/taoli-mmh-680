@@ -875,7 +875,7 @@ async fn open_manual_signal(state: &Arc<AppState>, code: &str) -> Result<String,
         .await
         .map(|snapshot| snapshot.report.clone());
     if let Err(reason) =
-        rh_auto::ensure_funding_allows(report.as_ref(), &base, long, short, 8, profit)
+        rh_auto::ensure_snapshot_funding_allows(report.as_ref(), &base, long, short, 8, profit)
     {
         state.alerts.notify(
             &format!("funding-block:{base}:{long}:{short}"),
